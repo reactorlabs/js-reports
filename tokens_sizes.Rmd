@@ -1,0 +1,57 @@
+---
+title: "Clone detection stuff"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+> These graphs are not checked yet
+
+### Configuration
+
+Edit this to update the notebook to your needs.
+
+```{R}
+INPUT_DIR <- "/home/peta/sourcerer/reporting/aws_withminjs_v6"
+#INPUT_DIR <- "/home/peta/sourcerer/reporting/jakub2"
+```
+
+### Importing data
+
+This imports the scripts for loading data and some basic graphs.
+
+```{r}
+source("clone_detection.r")
+source("graphs.r")
+```
+
+Load the data now:
+
+```{r}
+tokens <- read.tokens(paste(INPUT_DIR, "/tokens.txt", sep = ""), compress = F)
+tokens <- tokens[c("textSize", "text", "count")]
+```
+
+## Token Sizes
+
+```{r}
+summary(tokens$textSize)
+```
+
+And a histograms, first for the entire range, then w/o extremes:
+
+```{r}
+logHist(tokens$textSize, main = "Token Size", xlab = "size [b]", ylab = "# of tokens")
+p <- quantile(tokens$textSize, .98)
+logHist(tokens$textSize[ tokens$textSize < p ], main = "Token Size (no extremes)", xlab = "size [b]", ylab = "# of tokens")
+```
+
+Let's now examine the beginnings of the longest tokens, so that we have an idea what they are:
+
+```{r}
+x <- tokens[head(order(-tokens$textSize),100),]
+x$text <- sapply(x$text, unescape50)
+subset(x, select = c("text", "count", "textSize"))
+```
+Good thing here is that they seem all to be characters. I have to look further as to which files do the weird ones (i.e. all caps letters come from). It might be a proper string too, but can be archive remnants, etc. 
