@@ -1,0 +1,91 @@
+---
+title: "Clone detection stuff"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+> These graphs are not checked yet
+
+### Configuration
+
+Edit this to update the notebook to your needs.
+
+```{R}
+INPUT_DIR <- "/home/peta/sourcerer/reporting/aws_withminjs_v6"
+#INPUT_DIR <- "/home/peta/sourcerer/reporting/jakub2"
+```
+
+### Importing data
+
+This imports the scripts for loading data and some basic graphs.
+
+```{r}
+source("clone_detection.r")
+source("graphs.r")
+```
+
+Load the data now:
+
+```{r}
+tokens <- read.tokens(paste(INPUT_DIR, "/tokens.txt", sep = ""), compress = T)
+```
+
+## Token Frequencies
+
+```{r}
+summary(tokens$count)
+```
+Seems like most tokens do not appear in lot of files, however it is interesting to see that more than 50% of the tokens actually appear it at least 2 files. For smaller datasets, such as `jakub2` with 1000 projects this is not the case and more than 50% of tokens have only one use, so perhaps this is an artifact of having too much data...
+
+```{r}
+logHist(tokens$count, main = "# of token uses", xlab = " # token uses", ylab = "# of tokens", base = 100)
+normalHist(tokens$count [ tokens$count < 100], main = "# of token uses", xlab = " # token uses", ylab = "# of tokens")
+```
+As expected, the graph is dominated by tokens that have very little repetition, so next graphs ignore these and look at the range with more than 50 and less than 10000 uses:
+
+```{r}
+logHist(tokens$count [ tokens$count %in% 50:10000], main = "# of token uses", xlab = " # token uses", ylab = "# of tokens")
+normalHist(tokens$count [ tokens$count %in% 50:10000], main = "# of token uses", xlab = " # token uses", ylab = "# of tokens")
+```
+Some of the spikes are weird, lets look at what they are...
+
+```{r}
+spikedTokens <- tokens[tokens$count == 123,]
+```
+
+Summary:
+
+```{r}
+summary(spikedTokens)
+```
+
+Histograms of its tokens size:
+
+```{r}
+logHist(spikedTokens$textSize, main = "Token size", xlab = "Token size", ylab = "# of tokens")
+```
+Now, let's look at what some of them are, say sizes from 8 to 15:
+
+```{r}
+tmp <- spikedTokens[spikedTokens$textSize %in% 8:15,]
+tmp <- sapply(tmp$text, unescape, USE.NAMES = F)
+ttype = sapply(tmp, tokenType, USE.NAMES = F)
+summary(as.factor(ttype))
+tmp <- F # cleanup
+ttype <- F
+```
+
+That is a lot of numbers... Perhaps it has something to do with precisssion... The spikes might need more investigating
+
+So, what are the most frequent tokens? Here is top 100:
+
+```{r}
+x <- tokens[head(order(-tokens$count),100),]
+x$text <- sapply(x$text, unescape)
+subset(x, select = c("text", "count"))
+x <- F # cleanup
+```
+
+This does not seem too surprising, but is a nice validation. "Interesting" result might be that single quotes seem to be more popular than double quotes. 

@@ -1,0 +1,51 @@
+---
+title: "Clone detection stuff"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+> These graphs are not checked yet
+
+### Configuration
+
+Edit this to update the notebook to your needs.
+
+```{R}
+INPUT_DIR <- "/home/peta/sourcerer/reporting/aws_withminjs_v6"
+#INPUT_DIR <- "/home/peta/sourcerer/reporting/jakub2"
+```
+
+### Importing data
+
+This imports the scripts for loading data and some basic graphs.
+
+```{r}
+source("clone_detection.r")
+source("graphs.r")
+```
+
+Load the data now:
+
+```{r}
+tokens <- read.tokens(paste(INPUT_DIR, "/tokens.txt", sep = ""))
+```
+
+##  Relationship between token size and its frequency
+
+```{r}
+plot(tokens$textSize, tokens$count, main="Token size vs frequency", 
+  	xlab="Token size", ylab="# of uses", pch=4, log = "xy", col = "#0000ff")
+```
+
+## Token Types breakdown
+
+```{r}
+#ttypes = sapply(tokens$text, unescape50)
+#ttypes = sapply(ttypes, tokenType)
+#summary(as.factor(ttypes))
+```
+> This takes too long on R now, I'll update tokenizer to include the token type info in the tokens file, perhaps as well as other preprocessings
+
+More things to do may include separate analysis of numbers, and identifiers, and so on. 
