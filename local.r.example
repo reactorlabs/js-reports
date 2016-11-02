@@ -1,0 +1,10 @@
+# local configuration, this should be ignored by git
+MYSQL_HOST = "localhost"
+MYSQL_USER = "sourcerer"
+MYSQL_PASSWORD = "js"
+OVERWRITE = T
+DT_LIMIT = 20
+#TOKENIZER_OUTPUT_DIR = "/home/peta/sourcerer/processed/jakub2_fixed"
+TOKENIZER_OUTPUT_DIR = "/home/peta/sourcerer/reporting/aws_withminjs_v6"
+SOURCERER_OUTPUT_DIR = paste(TOKENIZER_OUTPUT_DIR, "sourcerer", sep = "/")
+MYSQL_DB_NAME = tail(strsplit(TOKENIZER_OUTPUT_DIR, "/")[[1]], n = 1)
