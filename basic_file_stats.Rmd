@@ -1,0 +1,428 @@
+---
+title: "Clone detection stuff"
+output:
+  html_document:
+    df_print: kable
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: no
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+
+# Setup
+
+
+## AWS Instance
+
+You can connect to the AWS instance which contains the entire dataset using the following command:
+
+```
+ssh -i ./ssh/amkey1.pem.txt ec2-user@52.210.148.46
+```
+
+> You need to have the `amkey1` file in order to be able to connect. 
+
+## Installing required software
+
+The following must be installed:
+
+- [js-tokenizer](https://github.com/reactorlabs/js-tokenizer)
+
+> TODO Fill in what to install, where to install it, etc. 
+
+## Running the clone detection
+
+> TODO tokenizer is a bit of mess now, must fix and write this section
+
+## Validating the tokenizer results
+
+(note this takes a looong time)
+
+## This notebook
+
+This notebook and its scripts provide all functionality required to run the analysis of Javascript tokenization and clone detection. It assumes that you have already installed all the required software and executed the tokenizer and clone detector, as described in previous chapters.
+
+When done, please read this section carefully as it guides you through the necessary setup you must perform in order to be able to run the code below. All of the configucation variables can either be specified here in the notebook and saved before the execution, or you may create local file named `local.r` and set the variables in it. At the end of the setup section, the script will automatically check for its existence and source it if found, overriding anything that is set in the notebook itself. 
+
+In order to run code in this notebook, we must load the required R scripts for database access and data manipulation. 
+
+```{r}
+source("clone_detection.r")
+```
+
+### Configuration
+
+We must then set up the database connection, please make sure that these values correspond to what you need:
+
+```{r}
+MYSQL_HOST = "localhost"
+# this user must be powerful enough to create databases, or the database must already exist
+MYSQL_USER = "sourcerer"
+MYSQL_PASSWORD = "js"
+```
+
+For the data loading and preprocessing, you may specify the override flag. During this phase the script checks that the data in the database correspond to the data on the disk by comparing the timestamps. If this situation is detected and `OVERRIDE` is set to `F` an error is printed, but the data in the database will not be touched. If it is `T`, then no error is printed, but the data is reloaded. And finally, if the flag is set to `"force"`, the data will be reloaded regardless of the timestamp. Setting the flag here has global validity, but you can also pass it to the loading and preprocessing functions to do a per-function update. 
+
+We also set the `DT_LIMIT` which the script uses to limit the sizes of the data tables when presented
+
+```{r}
+OVERWRITE = T
+DT_LIMIT = 20 
+```
+
+Next we have to prepare the database and tables and load the data produced by the tokenizer and sourcerer. For this, we must specify the root folder where the tokenizer output files are stored, and where the sourcerer CC's output for this particular set is stored. We must also name the database which will be created for the data. By default, the name of the output dir is used, but you may change this.
+
+> By default, we assume you have copied sourcerer CC's output into the sourcerer directory of the tokenizer output, but you may change this if you want.
+
+```{r}
+TOKENIZER_OUTPUT_DIR = "tokenizer/output/files"
+SOURCERER_OUTPUT_DIR = paste(TOKENIZER_OUTPUT_DIR, "sourcerer", sep = "/")
+MYSQL_DB_NAME = tail(strsplit(TOKENIZER_OUTPUT_DIR, "/")[[1]], n = 1)
+```
+
+Finally, let's check if we have local configuration and use that one instead of the one supplied with the notebook for easier management:
+
+```{r}
+if (file.exists("local.r")) {
+    println("Using local cofiguration instead:")
+    source("local.r")
+    println("  MYSQL_HOST:           ", MYSQL_HOST)
+    println("  MYSQL_DB_NAME:        ", MYSQL_DB_NAME)
+    println("  MYSQL_USER:           ", MYSQL_USER)
+    #println("  MYSQL_PASSWORD:       ", MYSQL_PASSWORD) #-- we do not want the password to be in the document
+    println("  TOKENIZER_OUTPUT_DIR: ", TOKENIZER_OUTPUT_DIR)
+    println("  SOURCERER_OUTPUT_DIR: ", SOURCERER_OUTPUT_DIR)
+    println("  OVERWRITE:            ", OVERWRITE)
+    println("  DT_LIMIT:             ", DT_LIMIT)
+}
+println("Using database ", MYSQL_DB_NAME)
+```
+
+### Running this notebook
+
+There are two options how you can run this notebook. You can use *RStudio*, which is better for interactivity and playing with the data, or you can use R's command line tools to generate the HTML w/o the need of RStudio and gui. In both cases the renderer runs all R code in this document and interleaves its results with the text. 
+
+#### Running from RStudio
+
+Download the latest RStudio as specified in [R notebooks](http://rmarkdown.rstudio.com/r_notebooks.html) in RStudio, so make sure to follow their advice. Once installed, you may open the `Rmd` file and then either hit `CTRL-ALT-R` which makes RStudio rerun all the code segments in the IDE itself. Alternatively you may execute current code segment by pressing `CTRL+Enter`. If you want to produce the clean html document instead, click on the *Knit HTML* (`CTRL+SHIFT+K`) command.
+
+#### Running from console
+
+You can also create the HTML document directly from R, using the `rmarkdown::render` function. Before doing so, the *pandoc* must be [setup properly](https://github.com/rstudio/rmarkdown/blob/master/PANDOC.md).
+
+> TODO I have not actually tested it as on my machine
+
+## Preprocessing
+
+Let's connect to the database server, create the database, load the data from tokenizer and sourcerer and preprocess it. These steps are only pefrormed if they are deemed necessary. The script uses timestamp data for the respective databases and reloads, or recreates the data only if necessary. 
+
+```{r}
+# connect to the database and create the table if it does not exist
+sql.connect(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB_NAME)
+
+# load tokenizer data into the database
+sql.loadTokenizerData(TOKENIZER_OUTPUT_DIR)
+
+# load sourcererCC's output data
+#sql.loadSourcererData(SOURCERER_OUTPUT_DIR)
+
+# create preprocessed tables for the tokenizer and sourcerer
+sql.createPreprocessedTables()
+
+# calculate clone groups as reported by the tokenizer
+calculateCloneGroups("tokenizer_clones", "tokenizer_clone_groups", "tokenizer_clone_info")
+
+# calculate clone groups as reported by the sourcerer
+#calculateCloneGroups2("sourcerer_clones", "sourcerer_clone_groups", "sourcerer_clone_info")
+
+# calculate non-empty files from the full statistics
+calculateNonEmptyFiles()
+    
+# calculate project statistics
+calculateProjectStats()
+
+println("Total database size ", sum(sql.query("SHOW TABLE STATUS")$Data_length) / 1024 / 1024, " [Mb]")
+
+```
+
+# Results
+
+We are now going to look at various simple statistics we can obtain from the tokenizer output. Where applicable, both summaries and histograms of the specified variables are shown. Note that most of the histogram scales are logarithmic. 
+
+
+## Tokenizer Output Stats
+
+```{r}
+files = list()
+files$total = sql.table.status("files_full_stats")$length
+files$unique = sql.table.status("files_stats")$length
+# empty files are not part of the sourcererCC's input and must therefore be excluded
+files$empty = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE totalTokens=0")[[1]]
+# files that are reported as not fully understood by the tokenizer
+files$error = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE errors>0")[[1]]
+
+println("Total files:    ", files$total)
+println("Unique files:   ", files$unique, "  ", files$unique / files$total, "%")
+println("Empty files:    ", files$empty, "  ",files$empty / files$total, "%")
+println("Error files:    ", files$error, "  ", files$error / files$total, "%")
+```
+
+> If the ratio of error files is high, then the tokenizer cannot be trusted to produce meaningful results, but small number of error files is totally ok - some of the javascript files are test cases that should error. 
+
+### Basic information about files
+
+```{r}
+# file size in bytes
+x <- sql.query("SELECT bytes FROM files_full_stats")$bytes
+summary(x)
+logHist(x, main = "File size [B]", xlab = "Size [B]", ylab = "# of files")
+
+# file size in lines of code (including empty and comments)
+x <- sql.query("SELECT loc FROM files_full_stats")$loc
+summary(x)
+logHist(x, main = "File size [LOC]", xlab = "Lines", ylab = "# of files")
+
+# # of total tokens in files
+x <- sql.query("SELECT totalTokens FROM files_full_stats")$totalTokens
+summary(x)
+logHist(x, main = "Tokens in files", xlab = "# of tokens", ylab = "# of files")
+
+# # of unique tokens in files (excluding repetitions)
+x <- sql.query("SELECT uniqueTokens FROM files_full_stats")$uniqueTokens
+summary(x)
+logHist(x, main = "Unique Tokens per File", xlab = "# of tokens", ylab = "# of files")
+```
+
+> We believe the peak at 1 LOC is due to min.js files which are minified version of javascript with no extra whitespace, and therefore no line breaks so the entire file is a single line. 
+
+### Composition of files
+
+```{r}
+# % of comments in the files
+x <- sql.query("SELECT (commentBytes/bytes) AS result FROM non_empty_files AS ne, files_full_stats AS fs WHERE ne.id = fs.id")$result
+summary(x)
+normalHist(x, main = "% of comment bytes in files", xlab = "% of bytes in comments")
+
+# % of whitespace in the files
+x <- sql.query("SELECT (whitespaceBytes/bytes) AS result FROM non_empty_files AS ne, files_full_stats AS fs WHERE ne.id = fs.id")$result
+summary(x)
+normalHist(x, main = "% of whitespace bytes in files", xlab = "% of bytes in whutespace")
+
+# % of separators in the files
+x <- sql.query("SELECT (separatorBytes/bytes) AS result FROM non_empty_files AS ne, files_full_stats AS fs WHERE ne.id = fs.id")$result
+summary(x)
+normalHist(x, main = "% of separator bytes in files", xlab = "% of bytes in separators")
+
+# % of tokens in the files
+x <- sql.query("SELECT (tokenBytes/bytes) AS result FROM non_empty_files AS ne, files_full_stats AS fs WHERE ne.id = fs.id")$result
+summary(x)
+normalHist(x, main = "% of token bytes in files", xlab = "% of bytes in tokens")
+```
+
+> Again the large number of files with 0 whitespace is due to minified javascript files. We will confirm this later by rerunning the tokenizer and excluding these. 
+
+### Basic Information about projects
+
+    x <- sql.query("SELECT ", field, " AS field FROM ", table)
+    x$field
+
+
+```{r}
+x <- sql.query("SELECT files FROM project_stats")$files
+summary(x)
+logHist(x, main = "Files per project" , xlab = "Size [B]", ylab = "# of projects")
+
+x <- sql.query("SELECT bytes FROM project_stats")$bytes
+summary(x)
+logHist(x, main = "Sum of size of project's JS files [B]", xlab = "Size [B]", ylab = "# of projects")
+
+x <- sql.query("SELECT loc FROM project_stats")$loc
+summary(x)
+logHist(x, main = "Sum of LOC of project JS files", xlab = "Lines", ylab = "# of projects")
+```
+
+Some of the projects are surprisingly large. Let us examine the largest projects out there:
+
+```{r}
+x <- sql.query("SELECT url, bytes, files FROM project_stats, bookkeeping_proj WHERE id=projectId ORDER BY bytes DESC LIMIT ", DT_LIMIT)
+x$path <- sapply(x$path, unescape)
+x
+```
+> TODO the tokenizer should also output github url for the project so that we can easily access them rather than clumsy local path
+
+### Information about tokens
+
+```{r}
+# token's size
+x <- sql.query("SELECT size FROM tokens")$size
+summary(x)
+# histogram over the entire range
+logHist(x, main = "Token Size", xlab = "size [b]", ylab = "# of tokens")
+
+# histogram of token sizes w/o extremes
+p <- quantile(x, .98)
+logHist(x[ x < p ], main = "Token Size (no extremes)", xlab = "size [b]", ylab = "# of tokens")
+```
+
+Let's now examine the longest tokens to see how they look like. The table shows the beginnings of the longest tokens, their size and # of occurences in the corpus.
+
+```{r}
+x <- sql.query("SELECT LEFT(text, 200) as text, size, count FROM tokens ORDER BY size DESC LIMIT ", DT_LIMIT)
+x$text <- sapply(x$text, unescape50)
+x
+```
+
+Let's also look at token frequencies:
+
+
+```{r}
+x <- sql.query("SELECT count FROM tokens")$count
+summary(x)
+logHist(x, main = "# of token uses", xlab = " # token uses", ylab = "# of tokens", base = 100)
+```
+
+> I have left out the detailed exploration of this graph because it was no longer adequate. Also there were no real findings from it at this point.
+
+Let's look at the most frequently used tokens:
+
+```{r}
+x <- sql.query("SELECT LEFT(text, 200) as text, count FROM tokens ORDER BY count DESC LIMIT ", DT_LIMIT)
+x$text <- sapply(x$text, unescape50)
+x
+```
+
+## Data analysis of clones
+
+All files that are reported to be clone of each other belong to a _clone group_. 
+
+```{r}
+# displays the clone info as obtained from given clone group tables
+displayCloneGroupsInfo <- function(clone.groups, clone.info, input.files) {
+    nf <- sql.table.status(input.files)$length
+    nc <- sql.table.status(clone.info)$length
+    ncg <- sql.table.status(clone.groups)$length
+    println("Input files:              ", nf)
+    println("Files which have clones:  ", nc)
+    println("Clone groups:             ", ncg)
+    println("Original files:           ", nf - nc + ncg, "  ", (nf - nc + ncg)/ nf, "[%]")
+}
+
+displayFilesPerCloneGroup <- function(clone.groups) {
+    # histogram of number of files in a clone group
+    x <- sql.query(" SELECT files FROM ", clone.groups)$files
+    print(summary(x))
+    logHist(x, main = "# of files in a clone group ", xlab = " # of files in group", ylab = "# of clone groups", base = 100)
+}
+
+displayProjectsPerCloneGroup <- function(clone.groups) {
+    # number of projects per clone group
+    x <- sql.query(" SELECT projects FROM ", clone.groups)$projects
+    print(summary(x))
+    logHist(x, main = "# of projects in a clone group ", xlab = " # of projects in group", ylab = "# of clone groups", base = 100)
+}
+
+```
+
+A simple function that displays most cloned files, counted either by number of copies, or by number of projects that contain a copy. Please note that the links to the files provided here are simply links to the clone group identifier, which is the first file reported as clone by the input data, it does not mean that it is the original. 
+
+```{r}
+mostClonedFiles <- function(clone.groups, countBy) {
+    # displaying clickable url in the final document
+    x <- sql.query("SELECT url, files, projects FROM ",clone.groups, " JOIN files_stats WHERE groupId=id ORDER BY ",countBy," DESC LIMIT ", DT_LIMIT)
+    x$url <- sapply(x$url, unescape)
+    x
+}
+```
+
+
+
+```{r}
+originalContent <- function(table, content) {
+    x <- sql.query("SELECT (orig.", content ," / all_.", content ,") AS pct FROM ", table, " AS orig, project_stats AS all_ WHERE all_.projectId=orig.projectId AND all_.", content," > 0")$pct
+    print(summary(x))
+    normalHist(x, main = paste("% of original", content, "in projects"), xlab = paste("% of original", content, " in project"), ylab = "# projects", base = 100)
+} 
+```
+
+### Clones as reported by the tokenizer 
+
+
+```{r}
+# basic info about number of files, clone groups, etc. 
+displayCloneGroupsInfo("tokenizer_clone_groups", "tokenizer_clone_info", "files_full_stats")
+# files per clone group statistic
+displayFilesPerCloneGroup("tokenizer_clone_groups")
+# projects per clone group statistic
+displayProjectsPerCloneGroup("tokenizer_clone_groups")
+# Links to mostly cloned files, ordered by absolute number of copies
+mostClonedFiles("tokenizer_clone_groups", countBy = "files")
+# Links to mostly cloned files, ordered by # of projects which contain them
+mostClonedFiles("tokenizer_clone_groups", countBy = "projects")
+```
+
+```{r}
+originalContent("tokenizer_project_stats_original", "files")
+originalContent("tokenizer_project_stats_original", "bytes")
+```
+
+
+Split first and last bins to see how many projects have 0 and 100% originality
+Get tokenizer to report creation dates of projects so that we can assert originals 
+
+
+
+
+### Clones as reported by sourcerer
+
+> These files are 70% or more compatible. 
+
+> TODO
+
+
+
+
+# Extra Stuff
+
+## More about this notebook
+
+> TODO explain how the notebook works
+
+
+
+# OLD STUFF TO BE REINCORPORATED INTO THE DOCUMENT
+
+
+#### Setting up MySQL
+
+Download MySQL using the default Linux (I can't speak for mac's) packages. It will prompt for root password - I am happily using that one. In order to be (a) able to load the data from disk, and (b) make MySQL a bit faster than the default, go into the `/etc/mysql/mysql.conf.d/mysqld.conf` and append:
+
+```
+secure_file_priv=""
+innodb_buffer_pool_size=10G # the more the better
+innodb_log_file_size=512M
+query_cache_size=0
+```
+
+> I have copied those from the internet and claim *no* real understanding of what they do - all I know the first one allows data loading, the second one sets memory.
+
+Once you have updated the config file, run:
+
+```
+sudo service mysql restart
+```
+
+Then connect to it using your favourite client (mine is [DataGrip](https://www.jetbrains.com/datagrip/)) and create the databases (and usernames if you do not want to use root access). You do not have to worry about the tables as they will be automatically created when the script runs (make sure you uncomment the data loading below).
+
+Mondego guys have a guide for using MySQL for data analysis available [here](https://github.com/Mondego/SourcererCC/blob/master/tokenizers/file-level/FileStats2MySQL.howto). It talks about python only a I had to adjust a few things on my computer to make it work, notably loading the data looks like:  
+
+```
+LOAD DATA LOCAL INFILE filename INTO TABLE tablename;
+```
+
+#### Configuration
+
+
+

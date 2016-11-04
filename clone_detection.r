@@ -53,10 +53,19 @@ sql.loadTokenizerData <- function(outputRoot, overwrite = OVERWRITE) {
     invisible(NULL)
 }
 
+sql.loadSourcererData <- function(outputRoot, overwrite = OVERWRITE) {
+    # now create the tables, if they do not exist
+    sql.createSourcererTables()
+    # now load the data, check the timestamps where necessary
+    sql.load.table("sourcerer_clones", paste(outputRoot, "clonepairs.txt", sep = "/"), overwrite)
+    invisible(NULL)
+}
+
 
 sql.table.status <- function(table) {
     x <- sql.query("SHOW TABLE STATUS WHERE NAME='",table,"'")
-    list(name = x$Name, length = x$Rows, bytes = x$Data_length)
+    cnt <- sql.query("SELECT COUNT(*) FROM ", table)
+    list(name = x$Name, length = cnt, bytes = x$Data_length)
 }
 
 sql.query <- function(...) {
@@ -79,43 +88,60 @@ sql.last.time <- function() {
         LAST_SQL_TIME_[["elapsed"]]
 }
 
-# Creates clone groups. The clone groups table 
+sql.affectedRows <- function() {
+    sql.query("SELECT ROW_COUNT()")
+}
+
+
+
+
+# Creates clone groups. 
 calculateCloneGroups <- function(table.from, table.clone_groups, table.clone_info, overwrite = OVERWRITE) {
     ts = sql.timestamp(table.from)
     if (sql.timestamp.shouldOverwrite(ts, table.clone_groups, overwrite) || sql.timestamp.shouldOverwrite(ts, table.clone_info, overwrite)) {
         println("Calculating clone groups from clone pairs in ", table.from)
         sql.query("DELETE FROM ", table.clone_groups)
         sql.query("DELETE FROM ", table.clone_info)
+        sql.query("CREATE TABLE tmp_diff (old INT NOT NULL, new INT NOT NULL, PRIMARY KEY(old))")
         t = system.time({
-            sql.query("DROP TABLE IF EXISTS tmp_clonepairs")
-            println("  cloning clone pairs info")
-            sql.query("CREATE TABLE tmp_clonepairs (SELECT * FROM ", table.from, ")")
-            i = 1
-            println("  building clone group membership, unaccounted ",sql.table.status("tmp_clonepairs")$length, ", iteration ", i)
-            # first add all files that are non-recursively defined, i.e. where the second file is first file in any other comparison (first files are clone groups)
-            sql.query("INSERT INTO ", table.clone_info, " SELECT fileId2, fileId1, projectId2 FROM tmp_clonepairs WHERE fileId2 NOT IN (SELECT fileId1 FROM tmp_clonepairs)")
-            # for each clone group, the first file (the one that is the group id as well) must also belong to the group
-            sql.query("INSERT IGNORE INTO ", table.clone_info, " SELECT fileId1, fileId1, projectId1 FROM tmp_clonepairs WHERE fileId1 NOT IN (SELECT fileId2 FROM tmp_clonepairs)")
-            # now repeatedly add further clones (i.e. those who are reported as clones of someone already having a clonegroup)
-            repeat {
-                ++i
-                # remove all files already accounted for 
-                # TODO this can be faster and use deltas
-                sql.query("DELETE FROM tmp_clonepairs WHERE fileId2 IN (SELECT fileId FROM ",table.clone_info,")") 
-                # if there are no more clone pairs to process, we are done
-                l <- sql.table.status("tmp_clonepairs")$length
-                if (l == 0)
-                    break
-                println("  building clone group membership, unaccounted ",sql.table.status("tmp_clonepairs")$length, ", iteration ", i)
-                # now get all unmatched, where the first file has already been accounted for and add the second into the same group
-                sql.query("INSERT INTO ", table.clone_info," SELECT fileId2, groupId, projectId2 FROM tmp_clonepairs JOIN ", table.clone_info," ON fileId1 = fileId")
-                # we will repeat this until we have no files left
+            # create a copy of the clone info first
+            sql.query("CREATE TABLE tmp_clones SELECT * FROM ", table.from)
+            println("  copied ", sql.table.status("tmp_clones")$length, " clone pair entries")
+            # do the initial group assignment
+            sql.query("INSERT IGNORE INTO ", table.clone_info, " SELECT fileId1, fileId2, projectId1 FROM tmp_clones")
+            sql.query("INSERT IGNORE INTO ", table.clone_info, " SELECT fileId2, fileId1, projectId2 FROM tmp_clones")
+            # remove the ones already accounted for 
+            sql.query("DELETE FROM tmp_clones WHERE EXISTS (SELECT 1 FROM ", table.clone_info, " WHERE tmp_clones.fileId1=fileId AND tmp_clones.fileId2=groupId)")
+            println("  initialized ", sql.table.status(table.clone_info)$length, " cloned files")
+            # let's now do the iterations
+            x <- sql.table.status("tmp_clones")$length
+            if (x > 0) {
+                # get distinct unifications into the tmp table
+                sql.query("INSERT IGNORE INTO tmp_diff SELECT fileId1, fileId2 FROM tmp_clones")
+                # see if there are more unifications we can enter in
+                repeat {
+                    x <- sql.affectedRows()
+                    if (x == 0)
+                        break
+                    println("  added ", x, " group unification records")
+                    sql.query("INSERT IGNORE INTO tmp_diff SELECT tmp_diff.old, tmp_clones.fileId2 FROM tmp_clones JOIN tmp_diff ON tmp_diff.new = tmp_clones.fileId1")
+                }
+                # and now perform the unification
+                println("  unifying clone groups")
+                repeat {
+                    sql.query("REPLACE INTO ", table.clone_info, " SELECT fileId, new, projectId FROM ",table.clone_info," JOIN tmp_diff ON groupId=old")
+                    x <- sql.affectedRows()
+                    if (x == 0)
+                        break
+                    println("    unified ", x, " rows")
+                }
             }
-            # cleanup the temp table
-            sql.query("DROP TABLE tmp_clonepairs")
             # build the clone groups summaries
             println("  building clone groups info")
             sql.query("INSERT INTO ", table.clone_groups," SELECT groupId, COUNT(fileId), COUNT(DISTINCT projectId) FROM ", table.clone_info ," GROUP BY groupId")
+            sql.query("DROP TABLE tmp_clones")
+            sql.query("DROP TABLE tmp_diff")
+            
         })
         println("  done in ", t[[3]], " [s]")
         sql.setTimestamp(table.clone_groups, ts)
@@ -179,22 +205,6 @@ calculateProjectStats <- function(overwrite = OVERWRITE) {
     println("  ", x$length, " entries [", x$bytes, " bytes]")
 }
 
-calculateTokenSizes <- function(overwrite = OVERWRITE) {
-    ts = sql.timestamp("tokens")
-    if (sql.timestamp.shouldOverwrite(ts, "tokens_size", overwrite)) {
-        println("Calculating token sizes")
-        sql.query("DELETE FROM tokens_size")
-        sql.query("INSERT INTO tokens_size SELECT id, CHAR_LENGTH(text) FROM tokens")
-        println("  done in ", sql.last.time(), "[s]")
-        sql.setTimestamp("tokens_size", ts)
-    } else {
-        println("Skipping calculating token sizes - already done, timestamp: ", timestamp.to.date(ts))
-    }
-    x <- sql.table.status("tokens_size")
-    println("  ", x$length, " entries [", x$bytes, " bytes]")
-}
-
-
 timestamp.to.date <- function(timestamp) {
     as.POSIXct(timestamp, origin="1970-01-01")    
 }
@@ -253,6 +263,7 @@ sql.createTokenizerTables <- function() {
     sql.query("CREATE TABLE IF NOT EXISTS bookkeeping_proj(
               id INT NOT NULL,
               path VARCHAR(1000) NOT NULL,
+              url VARCHAR(1000) NOT NULL,
               PRIMARY KEY(id))")
     println("bookkeeping_proj - project to path mapping")
     sql.query("CREATE TABLE IF NOT EXISTS tokenizer_clones (
@@ -279,6 +290,7 @@ sql.createTokenizerTables <- function() {
               projectId INT NOT NULL,
               projectPath VARCHAR(1000) NOT NULL,
               relPath VARCHAR(1000) NOT NULL,
+              created INT NOT NULL,
               bytes INT NOT NULL,
               commentBytes INT NOT NULL,
               whitespaceBytes INT NOT NULL,
@@ -297,6 +309,7 @@ sql.createTokenizerTables <- function() {
     sql.query("CREATE TABLE IF NOT EXISTS tokens(
               id INT NOT NULL,
               count INT NOT NULL,
+              size INT NOT NULL,
               text LONGTEXT NOT NULL,
               PRIMARY KEY(id));")
     println("tokens - tokens and their frequencies as reported by the tokenizer for all files")
@@ -314,8 +327,18 @@ sql.createTokenizerTables <- function() {
     }
 }
 
+sql.createSourcererTables <- function() {
+    sql.query("CREATE TABLE IF NOT EXISTS sourcerer_clones (
+              projectId1 INT NOT NULL,
+              fileId1 INT NOT NULL,
+              projectId2 INT NOT NULL,
+              fileId2 INT NOT NULL,
+              PRIMARY KEY(fileId1, fileId2))")
+    println("sourcerer_clones - clone pairs as reported by the sourcerer")
+}
+
 # creates tables for preprocessed data
-sql.createTokenizerPreprocessedTables <- function() {
+sql.createPreprocessedTables <- function() {
     sql.query("CREATE TABLE IF NOT EXISTS tokenizer_clone_groups (
         groupId INT NOT NULL,
         files INT NOT NULL,
@@ -360,11 +383,21 @@ sql.createTokenizerPreprocessedTables <- function() {
         errors INT NOT NULL,
         PRIMARY KEY(projectId))")
     println("tokenizer_project_stats_original - cummulative information about projects taken only from original files (as reported by the tokenizer)")
-    sql.query("CREATE TABLE IF NOT EXISTS tokens_size (
-              id INT NOT NULL,
-              textSize INT NOT NULL,
-              PRIMARY KEY(id))")
-    println("tokens_size - sizes of tokens")
+
+    # preprocessed tables for the sourcerer output
+
+    sql.query("CREATE TABLE IF NOT EXISTS sourcerer_clone_groups (
+        groupId INT NOT NULL,
+        files INT NOT NULL,
+        projects INT NOT NULL,
+        PRIMARY KEY(groupId))")
+    println("sourcerer_clone_groups - clone groups for files reported by the sourcerer as similar")
+    sql.query("CREATE TABLE IF NOT EXISTS sourcerer_clone_info (
+        fileId INT NOT NULL,
+        groupId INT NOT NULL,
+        projectId INT NOT NULL,
+        PRIMARY KEY(fileId))")
+    println("sourcerer_clone_info - relation between cloned files and their clone groups as reported by the sourcerer (similar files)")
 }
 
 # data converting
