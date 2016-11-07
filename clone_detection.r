@@ -41,17 +41,55 @@ sql.disconnect <- function() {
 }
 
 
-sql.loadTokenizerData <- function(outputRoot, overwrite = OVERWRITE) {
+loadTokenizerData <- function(outputRoot, overwrite = OVERWRITE) {
     # now create the tables, if they do not exist
     sql.createTokenizerTables()
-    # now load the data, check the timestamps where necessary
-    sql.load.table("bookkeeping_proj", paste(outputRoot, "bookkeeping_projs/bookkeeping-proj-0.txt", sep = "/"), overwrite)
-    sql.load.table("tokenizer_clones", paste(outputRoot, "clones/clones-0.txt", sep = "/"), overwrite)
-    sql.load.table("files_stats", paste(outputRoot, "files_stats/files-stats-0.txt", sep = "/"), overwrite)
-    sql.load.table("files_full_stats", paste(outputRoot, "files_full_stats/stats-full-0.txt", sep = "/"), overwrite)
-    sql.load.table("tokens", paste(outputRoot, "tokens.txt", sep = "/"), overwrite)
+    # now load the data, check the timestamps where necessary, create indexes on the primary keys
+    if (sql.load.table("bookkeeping_proj", paste(outputRoot, "bookkeeping_projs/bookkeeping-proj-0.txt", sep = "/"), overwrite))
+        println("  ", sql.createIndex("bookkeeping_proj", "id"))
+    if (sql.load.table("tokenizer_clones", paste(outputRoot, "clones/clones-0.txt", sep = "/"), overwrite))
+        println("  NO INDEX CREATED")
+    if (sql.load.table("files_stats", paste(outputRoot, "files_stats/files-stats-0.txt", sep = "/"), overwrite))
+        println("  ", sql.createIndex("files_stats", "id"))
+    if (sql.load.table("files_full_stats", paste(outputRoot, "files_full_stats/stats-full-0.txt", sep = "/"), overwrite))
+        println("  ", sql.createIndex("files_full_stats", "id"))
+    if (sql.load.table("tokens", paste(outputRoot, "tokens.txt", sep = "/"), overwrite))
+        println("  NO INDEX CREATED")
     invisible(NULL)
 }
+
+# Because sourcererCC can run in multiple nodes, multiple files can be ingested. 
+loadSourcererData <- function(outputRoot, overwrite = OVERWRITE) {
+    println("sourcerer_clones - clone pairs as reported by the sourcerer")
+    x <- list.files(outputRoot, full.names = T)
+    println("  ", length(x), " files found")
+    # find the newest file
+    modified = max(as.integer(file.info(x)$mtime))
+    if (sql.timestamp.shouldOverwrite(modified, "sourcerer_clones", overwrite)) {
+        t = system.time({
+            sql.query("DROP TABLE IF EXISTS sourcerer_clones")
+            sql.query("CREATE TABLE sourcerer_clones (
+                projectId1 INT NOT NULL,
+                fileId1 INT NOT NULL,
+                projectId2 INT NOT NULL,
+                fileId2 INT NOT NULL,
+                PRIMARY KEY(fileId1, fileId2))")
+            for (f in x) {
+                println("    loading file ", f)
+                sql.query("LOAD DATA LOCAL INFILE '", f, "' INTO TABLE sourcerer_clones FIELDS TERMINATED BY ',' ENCLOSED BY '\"'")
+                println("      ", sql.affectedRows(), " entries in ", sql.last.time(), " [s]")
+            }
+        })
+        println("  done in ", t[[3]], " [s]")
+        sql.setTimestamp("sourcerer_clones", modified)
+    } else {
+        println("  skipping loading table sourcerer_clones - already loaded, timestamp ", timestamp.to.date(modified))
+    }
+    x <- sql.table.status("sourcerer_clones", F)
+    println("  ~", x$length, " entries [", x$bytes, " bytes]")
+    invisible(NULL)
+}
+
 
 sql.loadSourcererData <- function(outputRoot, overwrite = OVERWRITE) {
     # now create the tables, if they do not exist
@@ -62,22 +100,28 @@ sql.loadSourcererData <- function(outputRoot, overwrite = OVERWRITE) {
 }
 
 
-sql.table.status <- function(table) {
+sql.table.status <- function(table, precise = T) {
     x <- sql.query("SHOW TABLE STATUS WHERE NAME='",table,"'")
-    cnt <- sql.query("SELECT COUNT(*) FROM ", table)
+    if (precise)
+        cnt <- sql.query("SELECT COUNT(*) FROM ", table)
+    else
+        cnt <- x$Rows
     list(name = x$Name, length = cnt, bytes = x$Data_length)
 }
 
-sql.query <- function(...) {
+sql.query <- function(..., updateTime = T) {
     result <- 0
     f <- function() {
         res <- dbSendQuery(DB_CONNECTION_, paste(..., sep = ""))         
         result <<- dbFetch(res, n = -1)
         dbClearResult(res)
     }
-    LAST_SQL_TIME_ <<- system.time({
+    if (updateTime)
+        LAST_SQL_TIME_ <<- system.time({
+            f()
+        })
+    else
         f()
-    })
     result
 }
 
@@ -89,103 +133,283 @@ sql.last.time <- function() {
 }
 
 sql.affectedRows <- function() {
-    sql.query("SELECT ROW_COUNT()")
+    sql.query("SELECT ROW_COUNT()", updateTime = F)
+}
+sql.createIndex <- function(table, column, unique = T) {
+    index = gsub(",", "", column)
+    index = gsub(" ", "", index)
+    index = paste("index_", index, sep="")
+    x <- sql.query("SHOW INDEX FROM ", table, " WHERE KEY_NAME=\"", index, "\"")$Key_name
+    if (length(x) > 0)
+        sql.query("DROP INDEX ", index, " ON ", table)
+    if (unique)
+        sql.query("CREATE UNIQUE INDEX ", index, " ON ", table, "(", column, ")")
+    else
+        sql.query("CREATE INDEX ", index, " ON ", table, "(", column, ")")
+    paste("created index ", column, " on table ", table, " in ", sql.last.time(), "[s]", sep = "")
 }
 
+# creates specified clone group and clone info tables
+createCloneGroupAndInfoTables <- function(table.clone_groups, table.clone_info) {
+    sql.query("DROP TABLE IF EXISTS ", table.clone_info)
+    sql.query("DROP TABLE IF EXISTS ", table.clone_groups)
+    sql.query("CREATE TABLE ", table.clone_info, "(
+            fileId INT NOT NULL,
+            groupId INT NOT NULL,
+            projectId INT NOT NULL,
+            PRIMARY KEY(fileId))")
+    sql.query("CREATE TABLE ", table.clone_groups, "(
+            groupId INT NOT NULL,
+            files INT NOT NULL,
+            projects INT NOT NULL,
+            oldestId INT NOT NULL,
+            PRIMARY KEY(groupId))")
+}
 
+# calculates clone group information, including group summaries and oldest file ids for each group
+calculateGroupSummaries <- function(table.clone_groups, table.clone_info) {
+    # now find oldest file for each clone group
+    sql.query("DROP TABLE IF EXISTS tmp_files")
+    sql.query("DROP TABLE IF EXISTS tmp_oldest")
+    sql.query("DROP TABLE IF EXISTS tmp_groups")
+    println("    finding oldest file in each clone group")
+    sql.query("CREATE TABLE tmp_files (SELECT fileId, groupId, created FROM files_full_stats INNER JOIN ", table.clone_info," ON fileId=id)")
+    println("      ", sql.affectedRows(), " cloned files accounted ", sql.last.time(), " [s]")
+    sql.query("CREATE TABLE tmp_oldest (
+                SELECT tmp_files.groupId AS groupId, MIN(fileId) as oldestId FROM 
+                (SELECT groupId, MIN(created) as oldest FROM tmp_files GROUP BY groupId) AS x
+                INNER JOIN tmp_files 
+                ON x.groupId=tmp_files.groupId AND x.oldest=tmp_files.created GROUP BY tmp_files.groupId)")
+    println("      ", sql.affectedRows(), " oldest files for clone groups found ", sql.last.time(), " [s]")
+    println("      ", sql.createIndex("tmp_oldest", "groupId"))
+    # now create clone group information 
+    println("    creating clone groups")
+    sql.query("CREATE TABLE tmp_groups (SELECT groupId, COUNT(fileId) AS files, COUNT(DISTINCT projectId) AS projects FROM ", table.clone_info, " GROUP BY groupId)");
+    println("      ", sql.affectedRows(), " groups aggregated ", sql.last.time(), "[s]")
+    println("      ", sql.createIndex("tmp_groups", "groupId"))
+    sql.query("INSERT INTO ", table.clone_groups, " SELECT tmp_groups.groupId, files, projects, oldestId FROM tmp_groups INNER JOIN tmp_oldest ON tmp_groups.groupId=tmp_oldest.groupId")
+    println("      ", sql.affectedRows(), " groups created ", sql.last.time(), "[s]")
+    println("      ", sql.createIndex(table.clone_groups, "groupId"))
+    sql.query("DROP TABLE tmp_files")
+    sql.query("DROP TABLE tmp_oldest")
+    sql.query("DROP TABLE tmp_groups")
+}
 
-
-# Creates clone groups. 
-calculateCloneGroups <- function(table.from, table.clone_groups, table.clone_info, overwrite = OVERWRITE) {
+# we can exploit the fact that tokenizer reports clones in a very rigid way. fileId1 is always a clone group, fileId2 is the cloned file
+calculateTokenizerCloneGroups <- function(table.from, prefix, overwrite = OVERWRITE) {
+    table.clone_info = paste(prefix, "_clone_info", sep="")
+    table.clone_groups = paste(prefix, "_clone_groups", sep="")
+    println(table.clone_groups, " - clone groups for files reported by the tokenizer as identical")
+    println(table.clone_info, " - relation between cloned files and their clone groups as reported by the tokenizer (identical files)")
     ts = sql.timestamp(table.from)
-    if (sql.timestamp.shouldOverwrite(ts, table.clone_groups, overwrite) || sql.timestamp.shouldOverwrite(ts, table.clone_info, overwrite)) {
-        println("Calculating clone groups from clone pairs in ", table.from)
-        sql.query("DELETE FROM ", table.clone_groups)
-        sql.query("DELETE FROM ", table.clone_info)
-        sql.query("CREATE TABLE tmp_diff (old INT NOT NULL, new INT NOT NULL, PRIMARY KEY(old))")
+    if (sql.timestamp.shouldOverwrite(ts, table.clone_groups, overwrite) || 
+        sql.timestamp.shouldOverwrite(ts, table.clone_info, overwrite)) {
+        println("  calculating tokenizer clone groups from clone pairs in ", table.from)
+        createCloneGroupAndInfoTables(table.clone_groups, table.clone_info)
+        sql.query("DROP TABLE IF EXISTS tmp_files")
+        sql.query("DROP TABLE IF EXISTS tmp_oldest")
+        sql.query("DROP TABLE IF EXISTS tmp_groups")
         t = system.time({
-            # create a copy of the clone info first
-            sql.query("CREATE TABLE tmp_clones SELECT * FROM ", table.from)
-            println("  copied ", sql.table.status("tmp_clones")$length, " clone pair entries")
-            # do the initial group assignment
-            sql.query("INSERT IGNORE INTO ", table.clone_info, " SELECT fileId1, fileId2, projectId1 FROM tmp_clones")
-            sql.query("INSERT IGNORE INTO ", table.clone_info, " SELECT fileId2, fileId1, projectId2 FROM tmp_clones")
-            # remove the ones already accounted for 
-            sql.query("DELETE FROM tmp_clones WHERE EXISTS (SELECT 1 FROM ", table.clone_info, " WHERE tmp_clones.fileId1=fileId AND tmp_clones.fileId2=groupId)")
-            println("  initialized ", sql.table.status(table.clone_info)$length, " cloned files")
-            # let's now do the iterations
-            x <- sql.table.status("tmp_clones")$length
-            if (x > 0) {
-                # get distinct unifications into the tmp table
-                sql.query("INSERT IGNORE INTO tmp_diff SELECT fileId1, fileId2 FROM tmp_clones")
-                # see if there are more unifications we can enter in
-                repeat {
-                    x <- sql.affectedRows()
-                    if (x == 0)
-                        break
-                    println("  added ", x, " group unification records")
-                    sql.query("INSERT IGNORE INTO tmp_diff SELECT tmp_diff.old, tmp_clones.fileId2 FROM tmp_clones JOIN tmp_diff ON tmp_diff.new = tmp_clones.fileId1")
-                }
-                # and now perform the unification
-                println("  unifying clone groups")
-                repeat {
-                    sql.query("REPLACE INTO ", table.clone_info, " SELECT fileId, new, projectId FROM ",table.clone_info," JOIN tmp_diff ON groupId=old")
-                    x <- sql.affectedRows()
-                    if (x == 0)
-                        break
-                    println("    unified ", x, " rows")
-                }
-            }
-            # build the clone groups summaries
-            println("  building clone groups info")
-            sql.query("INSERT INTO ", table.clone_groups," SELECT groupId, COUNT(fileId), COUNT(DISTINCT projectId) FROM ", table.clone_info ," GROUP BY groupId")
-            sql.query("DROP TABLE tmp_clones")
-            sql.query("DROP TABLE tmp_diff")
-            
+            # add clone pair entries
+            println("    building clone information")
+            sql.query("INSERT INTO ", table.clone_info, " SELECT fileId2, fileId1, projectId2 FROM ", table.from)
+            println("      initialized ", sql.affectedRows(), " clonepair entries ", sql.last.time(), "[s]")
+            sql.query("INSERT INTO ", table.clone_info, " SELECT fileId1, fileId1, MIN(projectId1) FROM ", table.from, " GROUP BY fileId1")
+            println("      added ", sql.affectedRows(), " groupd id mappings ", sql.last.time(), "[s]")
+            println("      ", sql.createIndex(table.clone_info, "fileId"))
+            # create group summaries and find oldest files
+            calculateGroupSummaries(table.clone_groups, table.clone_info)
         })
         println("  done in ", t[[3]], " [s]")
         sql.setTimestamp(table.clone_groups, ts)
         sql.setTimestamp(table.clone_info, ts)
-        
     } else {
-        println("Skipping clone groups preprocessing into ", table.from," - already created, timestamp: ", timestamp.to.date(ts))
+        println("  skipping tokenizer clone groups preprocessing into ", table.from," - already created, timestamp: ", timestamp.to.date(ts))
     }
-    x <- sql.table.status(table.clone_info)
-    println("  ", x$length, " entries [", x$bytes, " bytes]")
+    x <- sql.table.status(table.clone_info, F)
+    println("  ~", x$length, " entries [", x$bytes, " bytes]")
     x <- sql.table.status(table.clone_groups)
-    println("  ", x$length, " clone groups [", x$bytes, " bytes]")
+    println("  ~", x$length, " clone groups [", x$bytes, " bytes]")
+
+}
+
+calculateCloneGroups <- function(table.from, prefix, overwrite = OVERWRITE) {
+    table.clone_info = paste(prefix, "_clone_info", sep="")
+    table.clone_groups = paste(prefix, "_clone_groups", sep="")
+    println(table.clone_groups, " - clone groups for files reported by sourcererCC as similar")
+    println(table.clone_info, " - relation between cloned files and their clone groups as reported by the sourcererCC (similar files)")
+    ts = sql.timestamp(table.from)
+    if (sql.timestamp.shouldOverwrite(ts, table.clone_groups, overwrite) || 
+        sql.timestamp.shouldOverwrite(ts, table.clone_info, overwrite)) {
+        println("  calculating sourcerer clone groups from clone pairs in ", table.from)
+        createCloneGroupAndInfoTables(table.clone_groups, table.clone_info)
+        sql.query("DROP TABLE IF EXISTS tmp_clones")
+        sql.query("DROP TABLE IF EXISTS tmp_map")
+        sql.query("CREATE TABLE tmp_map (
+            oldId INT NOT NULL,
+            newId INT NOT NULL,
+            PRIMARY KEY(oldId))")
+        # create index on the map table
+        sql.createIndex("tmp_map", "oldId")
+        # copy the clone info and index it for faster operations in the future
+        sql.query("CREATE TABLE tmp_clones SELECT fileId1, fileId2 FROM ", table.from)
+        println("    copied ", sql.affectedRows(), " clone pairs in ", sql.last.time(), " [s]")
+        println("    ", sql.createIndex("tmp_clones", "fileId1, fileId2"))
+        # now insert the default mapping for each file
+        println("    inserting seed group ids")
+        sql.query("INSERT INTO ", table.clone_info, " SELECT fileId1, MIN(fileId2), MIN(projectId1) FROM ", table.from, " GROUP BY fileId1")
+        println("      ", sql.affectedRows(), " entries inserted in ", sql.last.time(), " [s]")
+        println("      ", sql.createIndex(table.clone_info, "fileid"));
+        println("      ", sql.createIndex(table.clone_info, "groupId", F))
+        sql.query("INSERT INTO ", table.clone_info, " SELECT fileId2, MIN(fileId1), MIN(projectId2) FROM ", table.from, " WHERE fileId2 NOT IN (SELECT fileId FROM ", table.clone_info, ") GROUP BY fileId2")
+        println("    unifying clone groups")
+        repeat {
+            sql.query("INSERT INTO tmp_map SELECT fileId1, MIN(fileId2) FROM tmp_clones WHERE fileId1 IN (SELECT groupId FROM ", table.clone_info, ") GROUP BY fileId1");
+            x <- sql.affectedRows();
+            if (x == 0)
+                break;
+            println("      ", x, " group mappings to be updated in ", sql.last.time(), " [s]")
+            sql.query("DELETE FROM tmp_clones WHERE EXISTS (SELECT 1 FROM tmp_map WHERE tmp_map.oldId=tmp_clones.fileId1 AND tmp_map.newId=tmp_clones.fileId2)");
+            println("        removed from unification list in ", sql.last.time(), "[s]")
+            repeat {
+                sql.query("REPLACE INTO ", table.clone_info, " SELECT fileId, newId, projectId FROM ", table.clone_info, " INNER JOIN tmp_map ON groupId=oldId");
+                x <- sql.affectedRows();
+                if (x == 0)
+                    break
+                println("        ", x, " group mappings unified")
+            }
+            sql.query("DELETE FROM tmp_map")
+        }
+        # now we have unified the clone groups, calculate clone group summaries and oldest files
+        calculateGroupSummaries(table.clone_groups, table.clone_info)
+        
+        sql.query("DROP TABLE tmp_map")
+        sql.query("DROP TABLE tmp_clones")
+        
+        sql.setTimestamp(table.clone_groups, ts)
+        sql.setTimestamp(table.clone_info, ts)
+    } else {
+        println("  skipping clone groups preprocessing into ", table.from," - already created, timestamp: ", timestamp.to.date(ts))
+    }
+    x <- sql.table.status(table.clone_info, F)
+    println("  ~", x$length, " entries [", x$bytes, " bytes]")
+    x <- sql.table.status(table.clone_groups)
+    println("  ~", x$length, " clone groups [", x$bytes, " bytes]")
 }
 
 # preprocessing - calculates non-empty files
 calculateNonEmptyFiles <- function(overwrite = OVERWRITE) {
+    println("non_empty_files - non empty files as reported by the tokenizer")
     ts = sql.timestamp("files_full_stats")
     if (sql.timestamp.shouldOverwrite(ts, "non_empty_files", overwrite)) {
-        println("Calculating non-empty files")
-        sql.query("DELETE FROM non_empty_files")        
+        println("  calculating non-empty files")
+        sql.query("DROP TABLE IF EXISTS non_empty_files")
+        sql.query("CREATE TABLE IF NOT EXISTS non_empty_files (
+        id INT NOT NULL,
+        PRIMARY KEY (id))")
         sql.query("INSERT INTO non_empty_files SELECT id FROM files_full_stats WHERE bytes > 0")
-        println("  done in ", sql.last.time(), "[s]")
+        println("    ", sql.affectedRows(), " non-empty files found in ", sql.last.time(), " [s]")
+        println("    ", sql.createIndex("non_empty_files", "id"))
+        println("    done in ", sql.last.time(), "[s]")
         sql.setTimestamp("non_empty_files", ts)
     } else {
-        println("Skipping preprocessing non-empty files - already done, timestamp: ", timestamp.to.date(ts))
+        println("  skipping preprocessing non-empty files - already done, timestamp: ", timestamp.to.date(ts))
     }
     x <- sql.table.status("non_empty_files")
     println("  ", x$length, " entries [", x$bytes, " bytes]")
 }
 
+calculateOriginalFiles <- function(table.into, table.from, prefix, include.oldest = T, overwrite = OVERWRITE) {
+    table.clone_info = paste(prefix, "_clone_info", sep="")
+    table.clone_groups = paste(prefix, "_clone_groups", sep="")
+     if (include.oldest) 
+        println(table.into, " - file ids that are not reported as identical by the tokenizer, including the oldest file from each group")
+    else
+        println(table.into, " - file ids that are not reported as identical by the tokenizer")
+    ts = sql.timestamp(table.from)
+    if (sql.timestamp.shouldOverwrite(ts, table.into, overwrite)) {
+        sql.query("DROP TABLE IF EXISTS ", table.into)
+        sql.query("CREATE TABLE ", table.into, " (id INT NOT NULL, PRIMARY KEY(id))")
+        sql.query("INSERT INTO ", table.into, " SELECT id FROM ", table.from, " WHERE id NOT IN (SELECT fileId FROM ", table.clone_info, ")")
+        println("    ", sql.affectedRows(), " entries in ", sql.last.time(), " [s]")
+        if (include.oldest) {
+            sql.query("INSERT INTO ", table.into, " SELECT DISTINCT oldestId FROM ", table.clone_groups)
+            println("    ", sql.affectedRows(), " oldest files treated as originals in ", sql.last.time(), "[s]")
+        }
+        println("    ", sql.createIndex(table.into, "id"))
+        sql.setTimestamp(table.into, ts)
+    } else {
+        println("  skipping preprocessing non identical ", prefix, " files - already done, timestamp: ", timestamp.to.date(ts))
+    }
+    x <- sql.table.status(table.into)
+    println("  ", x$length, " entries [", x$bytes, " bytes]")
+}
+
+calculateProjectOriginals <- function(table.into, table.originals, overwrite = OVERWRITE) {
+    println(table.into, " - statistics for projects using only files from ", table.originals)
+    ts = sql.timestamp(table.originals)
+    if (sql.timestamp.shouldOverwrite(ts, table.into, overwrite)) {
+        sql.query("DROP TABLE IF EXISTS ", table.into)
+        sql.query("CREATE TABLE IF NOT EXISTS ",table.into," (
+            projectId INT NOT NULL,
+            files INT NOT NULL,
+            bytes BIGINT NOT NULL,
+            commentBytes BIGINT NOT NULL,
+            whitespaceBytes BIGINT NOT NULL,
+            tokenBytes BIGINT NOT NULL,
+            separatorBytes INT NOT NULL,
+            loc INT NOT NULL,
+            commentLoc INT NOT NULL,
+            emptyLoc INT NOT NULL,
+            errors INT NOT NULL,
+            PRIMARY KEY(projectId))")
+        sql.query("INSERT INTO ",table.into," SELECT projectId, COUNT(*), SUM(bytes), SUM(commentBytes), SUM(whitespaceBytes), SUM(tokenBytes), SUM(separatorBytes), SUM(loc), SUM(commentLoc), SUM(emptyLoc), SUM(errors) FROM files_full_stats JOIN ", table.originals, " ON files_full_stats.id=", table.originals,".id GROUP BY projectId")
+        println("  inserted ", sql.affectedRows(), " entries in ", sql.last.time(), "[s]")
+        println("  ", sql.createIndex(table.into, "projectId"))
+        sql.query("INSERT INTO ",table.into," SELECT id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 FROM bookkeeping_proj WHERE id NOT IN (SELECT projectId FROM ", table.into, ")")
+        println("  added ", sql.affectedRows(), " empty projects in ", sql.last.time(), "[s]")
+        println("  ", sql.createIndex(table.into, "projectId"))
+        sql.setTimestamp(table.into, ts)        
+    } else {
+        println("  skipping preprocessing - already done, timestamp: ", timestamp.to.date(ts))
+    }
+    x <- sql.table.status(table.into)
+    println("  ", x$length, " entries [", x$bytes, " bytes]")
+}
+
+
 # calculates project summaries 
 calculateProjectStats <- function(overwrite = OVERWRITE) {
+    println("project_stats - cummulative information about projects")
     ts = sql.timestamp("files_full_stats")
     if (sql.timestamp.shouldOverwrite(ts, "project_stats", overwrite)) {
-        println("Calculating project statistics")
-        sql.query("DELETE FROM project_stats")
+        sql.query("DROP TABLE IF EXISTS project_stats")
+        sql.query("CREATE TABLE IF NOT EXISTS project_stats (
+            projectId INT NOT NULL,
+            files INT NOT NULL,
+            bytes BIGINT NOT NULL,
+            commentBytes BIGINT NOT NULL,
+            whitespaceBytes BIGINT NOT NULL,
+            tokenBytes BIGINT NOT NULL,
+            separatorBytes INT NOT NULL,
+            loc INT NOT NULL,
+            commentLoc INT NOT NULL,
+            emptyLoc INT NOT NULL,
+            errors INT NOT NULL,
+            PRIMARY KEY(projectId))")
         sql.query("INSERT INTO project_stats SELECT projectId, COUNT(*), SUM(bytes), SUM(commentBytes), SUM(whitespaceBytes), SUM(tokenBytes), SUM(separatorBytes), SUM(loc), SUM(commentLoc), SUM(emptyLoc), SUM(errors) FROM files_full_stats GROUP BY projectId")
         println("  done in ", sql.last.time(), "[s]")
+        println("  ", sql.createIndex("project_stats", "projectId"))
         sql.setTimestamp("project_stats", ts)
     } else {
-        println("Skipping calculating project statistics - already done, timestamp: ", timestamp.to.date(ts))
+        println("  skipping calculating project statistics - already done, timestamp: ", timestamp.to.date(ts))
     }
     x <- sql.table.status("project_stats")
     println("  ", x$length, " entries [", x$bytes, " bytes]")
+}
+
+calculateProjectOriginalityStats <- function(overwrite = OVERWRITE) {
+    
     
     ts = sql.timestamp("files_full_stats")
     if (sql.timestamp.shouldOverwrite(ts, "tokenizer_project_stats_original", overwrite)) {
@@ -239,7 +463,7 @@ sql.timestamp.shouldOverwrite <- function(expected, tableName, overwrite) {
     }
 }
 
-# fills the given table from specified file. 
+# fills the given table from specified file. Returns TRUE if the table has been created, FALSE if not. The table to which the data are to be loaded must be already created. 
 sql.load.table <- function(tableName, fromFile, overwrite = OVERWRITE) {
     if (! file.exists(fromFile))
         stop(paste("Unable to load table", tableName,"from file", fromFile,"- file not found"))
@@ -250,11 +474,14 @@ sql.load.table <- function(tableName, fromFile, overwrite = OVERWRITE) {
         sql.query("LOAD DATA LOCAL INFILE '", fromFile, "' INTO TABLE ", tableName, " FIELDS TERMINATED BY ',' ENCLOSED BY '\"'")
         println("  done in ", sql.last.time(), " [s]")
         sql.setTimestamp(tableName, modified)
+        result = T
     } else {
         println("Skipping loading table ", tableName," - already loaded, timestamp: ", timestamp.to.date(modified))
+        result = F
     }
-    x <- sql.table.status(tableName)
-    println("  ", x$length, " entries [", x$bytes, " bytes]")
+    x <- sql.table.status(tableName, F)
+    println("  ~", x$length, " entries [", x$bytes, " bytes]")
+    result
 }
 
 
@@ -290,6 +517,7 @@ sql.createTokenizerTables <- function() {
               projectId INT NOT NULL,
               projectPath VARCHAR(1000) NOT NULL,
               relPath VARCHAR(1000) NOT NULL,
+              url VARCHAR(1000) NOT NULL,
               created INT NOT NULL,
               bytes INT NOT NULL,
               commentBytes INT NOT NULL,
@@ -327,48 +555,9 @@ sql.createTokenizerTables <- function() {
     }
 }
 
-sql.createSourcererTables <- function() {
-    sql.query("CREATE TABLE IF NOT EXISTS sourcerer_clones (
-              projectId1 INT NOT NULL,
-              fileId1 INT NOT NULL,
-              projectId2 INT NOT NULL,
-              fileId2 INT NOT NULL,
-              PRIMARY KEY(fileId1, fileId2))")
-    println("sourcerer_clones - clone pairs as reported by the sourcerer")
-}
 
 # creates tables for preprocessed data
 sql.createPreprocessedTables <- function() {
-    sql.query("CREATE TABLE IF NOT EXISTS tokenizer_clone_groups (
-        groupId INT NOT NULL,
-        files INT NOT NULL,
-        projects INT NOT NULL,
-        PRIMARY KEY(groupId))")
-    println("tokenizer_clone_groups - clone groups for files reported by the tokenizer as identical")
-    sql.query("CREATE TABLE IF NOT EXISTS tokenizer_clone_info (
-        fileId INT NOT NULL,
-        groupId INT NOT NULL,
-        projectId INT NOT NULL,
-        PRIMARY KEY(fileId))")
-    println("tokenizer_clone_info - relation between cloned files and their clone groups as reported by the tokenizer (identical files)")
-    sql.query("CREATE TABLE IF NOT EXISTS non_empty_files (
-        id INT NOT NULL,
-        PRIMARY KEY (id))")
-    println("non_empty_files - non empty files as reported by the tokenizer")
-    sql.query("CREATE TABLE IF NOT EXISTS project_stats (
-        projectId INT NOT NULL,
-        files INT NOT NULL,
-        bytes BIGINT NOT NULL,
-        commentBytes BIGINT NOT NULL,
-        whitespaceBytes BIGINT NOT NULL,
-        tokenBytes BIGINT NOT NULL,
-        separatorBytes INT NOT NULL,
-        loc INT NOT NULL,
-        commentLoc INT NOT NULL,
-        emptyLoc INT NOT NULL,
-        errors INT NOT NULL,
-        PRIMARY KEY(projectId))")
-    println("project_stats - cummulative information about projects")
     sql.query("CREATE TABLE IF NOT EXISTS tokenizer_project_stats_original (
         projectId INT NOT NULL,
         files INT NOT NULL,
@@ -399,6 +588,68 @@ sql.createPreprocessedTables <- function() {
         PRIMARY KEY(fileId))")
     println("sourcerer_clone_info - relation between cloned files and their clone groups as reported by the sourcerer (similar files)")
 }
+
+
+# data presenting
+
+# displays the clone info as obtained from given clone group tables
+displayCloneGroupsInfo <- function(clone.groups, clone.info, input.files) {
+    nf <- sql.table.status(input.files)$length
+    nc <- sql.table.status(clone.info)$length
+    ncg <- sql.table.status(clone.groups)$length
+    println("Input files:              ", nf)
+    println("Files which have clones:  ", nc)
+    println("Clone groups:             ", ncg)
+    println("Original files:           ", nf - nc + ncg, "  ", (nf - nc + ncg)/ nf, "[%]")
+}
+
+displayFilesPerCloneGroup <- function(clone.groups) {
+    # histogram of number of files in a clone group
+    x <- sql.query(" SELECT files FROM ", clone.groups)$files
+    print(summary(x))
+    logHist(x, main = "# of files in a clone group ", xlab = " # of files in group", ylab = "# of clone groups", base = 100)
+}
+
+displayProjectsPerCloneGroup <- function(clone.groups) {
+    # number of projects per clone group
+    x <- sql.query(" SELECT projects FROM ", clone.groups)$projects
+    print(summary(x))
+    logHist(x, main = "# of projects in a clone group ", xlab = " # of projects in group", ylab = "# of clone groups", base = 100)
+}
+
+mostClonedFiles <- function(clone.groups, countBy) {
+    # displaying clickable url in the final document
+    x <- sql.query("SELECT url, files, projects FROM ",clone.groups, " JOIN files_full_stats ON oldestId=id ORDER BY ",countBy," DESC LIMIT ", DT_LIMIT)
+    x$url <- sapply(x$url, unescape)
+    x
+}
+
+originalContentPerProject <- function(table, content) {
+    x <- sql.query("SELECT (",table, ".", content, " / project_stats.", content,") AS result FROM project_stats JOIN ", table, " ON project_stats.projectId=", table, ".projectId")$result
+    print(summary(x))
+    normalHist(x, main = paste("% of original", content, "in projects"), xlab = paste("% of original", content, " in project"), ylab = "# projects", base = 100)
+} 
+
+mostOriginalProjects <- function(table, content, limit) {
+    x <- sql.query("SELECT url, (two.", content, " / one.",content,") AS original, one.",content," AS total
+        FROM project_stats AS one
+        JOIN ", table, " AS two ON one.projectId = two.projectId
+        JOIN bookkeeping_proj ON bookkeeping_proj.id = two.projectId
+        ORDER BY original DESC, total DESC LIMIT ", limit)
+    x
+}
+
+leastOriginalProjects <- function(table, content, limit) {
+    x <- sql.query("SELECT url, (two.", content, " / one.",content,") AS original, one.files AS numFiles
+        FROM project_stats AS one
+        JOIN ", table, " AS two ON one.projectId = two.projectId
+        JOIN bookkeeping_proj ON bookkeeping_proj.id = two.projectId
+        ORDER BY original, numFiles DESC LIMIT ", limit)
+    x
+}
+
+
+
 
 # data converting
 

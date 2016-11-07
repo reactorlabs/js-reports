@@ -12,36 +12,157 @@ output:
   word_document: default
 ---
 
+# TODO
+
+- indexing
+- rewrite the oldest file in group heuristic
+- check that sourcerercc clone detection works, and change if not
+- fix tokenizer & rerun if necessary
+
 # Setup
 
 
 ## AWS Instance
 
-You can connect to the AWS instance which contains the entire dataset using the following command:
+To connect to the AWS instance, you need to have the identity file (`amkey1.pem`) installed. You can then connect to the instance using the following command:
 
 ```
 ssh -i ./ssh/amkey1.pem.txt ec2-user@52.210.148.46
 ```
 
-> You need to have the `amkey1` file in order to be able to connect. 
+The following command copies remote files on aws to local directory:
 
-## Installing required software
+```
+scp -i amkey1.pem ec2-user@52.210.148.46:/path_to_source_file .
+```
 
-The following must be installed:
+Our dataset lives in `mnt/data1/data70k` and `mnt/data2/data70k2`. The tokenizer and sourcererCC are already installed in `/mnt/data2/peta`, however, it would be better for you to start from scratch, getting both the tokenizer and the sourcerer from github:
 
-- [js-tokenizer](https://github.com/reactorlabs/js-tokenizer)
+```
+git clone https://github.com/reactorlabs/js-tokenizer.git
+git clone https://github.com/Mondego/SourcererCC.git
+```
 
-> TODO Fill in what to install, where to install it, etc. 
+## Setting up MySQL database
 
-## Running the clone detection
+### MySQL on AWS
 
-> TODO tokenizer is a bit of mess now, must fix and write this section
+> Jakub, can you provided details on how is SQL installed on AWS? 
+
+### Setting up MySQL locally
+
+Download MySQL or MariaDB using the default Linux (I can't speak for mac) packages. It will prompt you for a root password - and you can happily use that one for the script below if you ignore security - I do:-)
+
+After it is installed, check that it has decent memory and that it can be populated from local files without restrictions, e.g. open file  `/etc/mysql/mysql.conf.d/mysqld.conf` and append:
+
+```
+secure_file_priv=""
+innodb_buffer_pool_size=10G # the more the better
+innodb_log_file_size=512M
+query_cache_size=0
+```
+
+> I have copied those from the internet and claim *no* real understanding of what they do - all I know the first one allows data loading, the second one sets memory.
+
+Once you have updated the config file, run:
+
+```
+sudo service mysql restart
+```
+
+# Obtaining the data
+
+## Tokenization
+
+At this point the tokenizer is not entirely user friendly. There are few important things that you should setup before running it and you have to change these in the source code. Open `main.cpp` file and change number of threads for different worker types. So far the best setup I found is having 1 writer, and `N` mergers, crawlers and tokenizers, where `N` is the number of cores on the machine. Also make sure to check the values of worker queues otherwise you may run out of memory. 
+
+> See details of how tokenier works in one of the appendices.
+
+To build the tokenizr, go to its folder, and execute the following:
+
+```
+mkdir build
+cd build
+cmake ..
+make
+```
+
+Once the tokenizer has been built, you can ran it on your data. To tokenize, the first argument must be `-t`, followed by a directory to which all outputs will be dumped and then at least one, but possibly more root directories which will be scanned for git projects. So, if we use the AWS as an example and we want our output to be in `/mnt/data2/tokenizer_output`, run the following:
+
+```
+js-tokenizer -t /mnt/data2/tokenizer_output /mnt/data1/data70k /mnt/data2/data70k2
+```
+
+> Note that this may take hours, the tokenizer will report each second about its progress> When it is done, the final report might look like this: (this is actually output for the `processed_061116` dataset, see the appendix for more information about what the output actually does)
+
+```
+Crawler        active  0 queue        0 done    336170 errors 0
+Tokenizer      active  0 queue        0 done     72898 errors 24
+Merger         active  0 queue        0 done  18940165 errors 0
+Writer         active  0 queue        0 done  18940371 errors 0
+
+Files      18940371 tokenizer18940371 merger18940371 writer
+Bytes      366805.24 tokenizer366805.24 merger366805.24 writer [MB]
+Throughput    12.07 tokenizer   12.07 merger   12.07 writer [MB/s]
+
+Unique tokens     38431688
+Empty files       71819 (0.379185%)
+Detected clones   17398449 (91.8591%)
+```
+
+If you want to copy this to your local folder, make sure to compress the whole output directory, such as:
+
+```
+tar -zcvf tokenizer_output.tar.gz /mnt/data2/tokenizer_output
+
+```
 
 ## Validating the tokenizer results
 
-(note this takes a looong time)
+> TODO 
 
-## This notebook
+## Clone detection
+
+Inside sourcererCC's directory go to `clone-detector` folder. Make sure the directories `input/dataset` and `input/query` exist there. Copy the `files_tokens/files-tokens-0.txt` file from the tokenizer's output to `input/dataset` and rename it to `blocks.file`:
+
+```
+cd clone-detector
+mkdir input/dataset
+mkdir input/query
+cp /mnt/data2/tokenizer_output/files_tokens/files-tokens-0.txt input/dataset/blocks.file
+```
+
+Then we must decide on sharding. Sourcerer provides a python script to help with that, to use it, run the following from the `clone-detector` directory:
+
+```
+python ../scripts-data-analysis/pre-CC/step4/find-sharding-intervals.py input/dataset/blocks.file
+```
+
+This will find the best intervals and give you a setting for the `SHARD_MAX_NUM_TOKENS` in `sourcerer-cc.properties` file in the `clone-detector` directory. Update it, and also make sure to change the `MAX_TOKENS` variable in the same file. 
+
+> TODO I am not convinced the shard calculator works (they seem to confuse unique & total tokens, etc). Also I would rather have it produce specific number of intervals. We can easily recreate it in R. 
+
+Now we are ready to run the clone detector. The initialization and indexing do not benefit from parallelization, so execute the following:
+
+```
+./execute.sh 1
+./runnodes.sh init 1
+./runnodes.sh index 1
+./mergeindexes.sh
+```
+
+> If you get an error about Java versin in the second command, open `runnodes.sh` and add `-Dbuild.compiler=javac1.7` to the ant commandline (this happens on the AWS). If you get an error that Java was not found, updated the `JAVA_HOME` variable: `export JAVA_HOME="/opt/jdk"`
+
+Once indexing is done, we can start clone search phase using as many nodes as recommended by the shard analysis above, so for 3 nodes, we must run:
+
+```
+./execute.sh 3
+./runnodes.sh search 3
+```
+
+> TODO what to do next, fill in when I get here
+
+# Running this notebook
 
 This notebook and its scripts provide all functionality required to run the analysis of Javascript tokenization and clone detection. It assumes that you have already installed all the required software and executed the tokenizer and clone detector, as described in previous chapters.
 
@@ -53,7 +174,7 @@ In order to run code in this notebook, we must load the required R scripts for d
 source("clone_detection.r")
 ```
 
-### Configuration
+## Configuration
 
 We must then set up the database connection, please make sure that these values correspond to what you need:
 
@@ -120,29 +241,53 @@ You can also create the HTML document directly from R, using the `rmarkdown::ren
 Let's connect to the database server, create the database, load the data from tokenizer and sourcerer and preprocess it. These steps are only pefrormed if they are deemed necessary. The script uses timestamp data for the respective databases and reloads, or recreates the data only if necessary. 
 
 ```{r}
+
 # connect to the database and create the table if it does not exist
 sql.connect(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB_NAME)
 
 # load tokenizer data into the database
-sql.loadTokenizerData(TOKENIZER_OUTPUT_DIR)
+loadTokenizerData(TOKENIZER_OUTPUT_DIR)
 
-# load sourcererCC's output data
-#sql.loadSourcererData(SOURCERER_OUTPUT_DIR)
-
-# create preprocessed tables for the tokenizer and sourcerer
-sql.createPreprocessedTables()
-
-# calculate clone groups as reported by the tokenizer
-calculateCloneGroups("tokenizer_clones", "tokenizer_clone_groups", "tokenizer_clone_info")
-
-# calculate clone groups as reported by the sourcerer
-#calculateCloneGroups2("sourcerer_clones", "sourcerer_clone_groups", "sourcerer_clone_info")
+# now load sourcererCC's data
+loadSourcererData(SOURCERER_OUTPUT_DIR)
 
 # calculate non-empty files from the full statistics
 calculateNonEmptyFiles()
-    
+
+# calculate clone groups as reported by the tokenizer
+calculateTokenizerCloneGroups("tokenizer_clones", "tokenizer")
+
+# calculate clone groups as reported by the sourcerer
+calculateCloneGroups("sourcerer_clones", "sourcerer")
+
 # calculate project statistics
 calculateProjectStats()
+
+# calculate non-identical files from tokenizer's perspective
+calculateOriginalFiles("tokenizer_originals", "files_full_stats", "tokenizer")
+
+# calculate cummulative statistics for projects using only non-identical files (as tagged by tokenizer)
+calculateProjectOriginals("tokenizer_project_stats", "tokenizer_originals")
+
+# calculate non-identical files from tokenizer's perspective, oldest file from each group is not treated as original 
+calculateOriginalFiles("tokenizer_originals_clones", "files_full_stats", "tokenizer", include.oldest = F)
+
+# calclate non-identical files from tokenizer's perspective, oldest files from group are treated as identical to the rest of the group
+calculateProjectOriginals("tokenizer_clones_stats", "tokenizer_originals_clones")
+
+# calculate non-identical files from sourcerer's perspective
+calculateOriginalFiles("sourcerer_originals", "files_stats", "sourcerer")
+
+# calculate cummulative statistics for projects using only non-similar files (as tagged by sourcerer)
+calculateProjectOriginals("sourcerer_project_stats", "sourcerer_originals")
+
+# calculate non-identical files from sourcerer's perspective, oldest file from each group is not treated as original 
+calculateOriginalFiles("sourcerer_originals_clones", "files_full_stats", "sourcerer", include.oldest = F)
+
+# calclate non-identical files from sourcerer's perspective, oldest files from group are treated as identical to the rest of the group
+calculateProjectOriginals("sourcerer_clones_stats", "sourcerer_originals_clones")
+
+
 
 println("Total database size ", sum(sql.query("SHOW TABLE STATUS")$Data_length) / 1024 / 1024, " [Mb]")
 
@@ -153,7 +298,7 @@ println("Total database size ", sum(sql.query("SHOW TABLE STATUS")$Data_length) 
 We are now going to look at various simple statistics we can obtain from the tokenizer output. Where applicable, both summaries and histograms of the specified variables are shown. Note that most of the histogram scales are logarithmic. 
 
 
-## Tokenizer Output Stats
+## Summary
 
 ```{r}
 files = list()
@@ -163,11 +308,28 @@ files$unique = sql.table.status("files_stats")$length
 files$empty = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE totalTokens=0")[[1]]
 # files that are reported as not fully understood by the tokenizer
 files$error = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE errors>0")[[1]]
+files$distinctFileHash = sql.query("SELECT COUNT(DISTINCT filehash) FROM files_full_stats")[[1]]
+files$distinctTokenHash = sql.query("SELECT COUNT(DISTINCT tokensHash) FROM files_full_stats")[[1]]
+files$nonCloned = files$unique - sql.table.status("sourcerer_clone_info")$length
 
-println("Total files:    ", files$total)
-println("Unique files:   ", files$unique, "  ", files$unique / files$total, "%")
-println("Empty files:    ", files$empty, "  ",files$empty / files$total, "%")
-println("Error files:    ", files$error, "  ", files$error / files$total, "%")
+projects = list()
+projects$total = sql.table.status("bookkeeping_proj")$length
+projects$unique = sql.query("SELECT COUNT(DISTINCT projectId) FROM tokenizer_clones_stats WHERE files > 0")[[1]]
+projects$nonCloned = sql.query("SELECT COUNT(DISTINCT projectId) FROM sourcerer_clones_stats WHERE files > 0")[[1]]
+projects$uniqueAndOriginals = sql.query("SELECT COUNT(DISTINCT projectId) FROM tokenizer_project_stats WHERE files > 0")[[1]]
+projects$nonClonedAndOriginals = sql.query("SELECT COUNT(DISTINCT projectId) FROM sourcerer_project_stats WHERE files > 0")[[1]]
+
+println("Total projects:                         ", projects$total)
+println("Files processed:                        ", files$total)
+println("Empty files:                            ", files$empty, "  ",files$empty / files$total, "%")
+println("Error files:                            ", files$error, "  ", files$error / files$total, "%")
+println("Distinct file hashes:                   ", files$distinctFileHash, " ", files$distinctFileHash / files$total, "%")
+println("Distinct token hashes:                  ", files$distinctTokenHash, " ", files$distinctTokenHash / files$total, "%")
+println("Non-cloned files:                       ", files$nonCloned, " ", files$nonCloned / files$total, "%")
+println("Projects with unique files:             ", projects$unique, " ", projects$unique / projects$total, "%")
+println("Projects non-cloned files:              ", projects$nonCloned, " ", projects$nonCloned / projects$total, "%")
+println("Projects with unique or original files: ", projects$uniqueAndOriginals, " ", projects$uniqueAndOriginals / projects$total, "%")
+println("Projects non-cloned or original files:  ", projects$nonClonedAndOriginals, " ", projects$nonClonedAndOriginals / projects$total, "%")
 ```
 
 > If the ratio of error files is high, then the tokenizer cannot be trusted to produce meaningful results, but small number of error files is totally ok - some of the javascript files are test cases that should error. 
@@ -248,10 +410,9 @@ Some of the projects are surprisingly large. Let us examine the largest projects
 
 ```{r}
 x <- sql.query("SELECT url, bytes, files FROM project_stats, bookkeeping_proj WHERE id=projectId ORDER BY bytes DESC LIMIT ", DT_LIMIT)
-x$path <- sapply(x$path, unescape)
+x$url <- sapply(x$url, unescape)
 x
 ```
-> TODO the tokenizer should also output github url for the project so that we can easily access them rather than clumsy local path
 
 ### Information about tokens
 
@@ -298,131 +459,171 @@ x
 
 All files that are reported to be clone of each other belong to a _clone group_. 
 
-```{r}
-# displays the clone info as obtained from given clone group tables
-displayCloneGroupsInfo <- function(clone.groups, clone.info, input.files) {
-    nf <- sql.table.status(input.files)$length
-    nc <- sql.table.status(clone.info)$length
-    ncg <- sql.table.status(clone.groups)$length
-    println("Input files:              ", nf)
-    println("Files which have clones:  ", nc)
-    println("Clone groups:             ", ncg)
-    println("Original files:           ", nf - nc + ncg, "  ", (nf - nc + ncg)/ nf, "[%]")
-}
-
-displayFilesPerCloneGroup <- function(clone.groups) {
-    # histogram of number of files in a clone group
-    x <- sql.query(" SELECT files FROM ", clone.groups)$files
-    print(summary(x))
-    logHist(x, main = "# of files in a clone group ", xlab = " # of files in group", ylab = "# of clone groups", base = 100)
-}
-
-displayProjectsPerCloneGroup <- function(clone.groups) {
-    # number of projects per clone group
-    x <- sql.query(" SELECT projects FROM ", clone.groups)$projects
-    print(summary(x))
-    logHist(x, main = "# of projects in a clone group ", xlab = " # of projects in group", ylab = "# of clone groups", base = 100)
-}
-
-```
-
-A simple function that displays most cloned files, counted either by number of copies, or by number of projects that contain a copy. Please note that the links to the files provided here are simply links to the clone group identifier, which is the first file reported as clone by the input data, it does not mean that it is the original. 
-
-```{r}
-mostClonedFiles <- function(clone.groups, countBy) {
-    # displaying clickable url in the final document
-    x <- sql.query("SELECT url, files, projects FROM ",clone.groups, " JOIN files_stats WHERE groupId=id ORDER BY ",countBy," DESC LIMIT ", DT_LIMIT)
-    x$url <- sapply(x$url, unescape)
-    x
-}
-```
-
-
-
-```{r}
-originalContent <- function(table, content) {
-    x <- sql.query("SELECT (orig.", content ," / all_.", content ,") AS pct FROM ", table, " AS orig, project_stats AS all_ WHERE all_.projectId=orig.projectId AND all_.", content," > 0")$pct
-    print(summary(x))
-    normalHist(x, main = paste("% of original", content, "in projects"), xlab = paste("% of original", content, " in project"), ylab = "# projects", base = 100)
-} 
-```
 
 ### Clones as reported by the tokenizer 
 
 
 ```{r}
+ctype = "tokenizer"
+table.originals = paste(ctype, "_originals", sep = "")
+table.clone_groups = paste(ctype, "_clone_groups", sep = "")
+table.clone_info = paste(ctype, "_clone_info", sep = "")
+table.project_stats = paste(ctype, "_project_stats", sep = "")
+```
+
+
+
+```{r}
 # basic info about number of files, clone groups, etc. 
-displayCloneGroupsInfo("tokenizer_clone_groups", "tokenizer_clone_info", "files_full_stats")
+displayCloneGroupsInfo(table.clone_groups, table.clone_info, "files_full_stats")
 # files per clone group statistic
-displayFilesPerCloneGroup("tokenizer_clone_groups")
+displayFilesPerCloneGroup(table.clone_groups)
 # projects per clone group statistic
-displayProjectsPerCloneGroup("tokenizer_clone_groups")
+displayProjectsPerCloneGroup(table.clone_groups)
 # Links to mostly cloned files, ordered by absolute number of copies
-mostClonedFiles("tokenizer_clone_groups", countBy = "files")
+mostClonedFiles(table.clone_groups, countBy = "files")
 # Links to mostly cloned files, ordered by # of projects which contain them
-mostClonedFiles("tokenizer_clone_groups", countBy = "projects")
+mostClonedFiles(table.clone_groups, countBy = "projects")
 ```
 
 ```{r}
-originalContent("tokenizer_project_stats_original", "files")
-originalContent("tokenizer_project_stats_original", "bytes")
+originalContentPerProject(table.project_stats, "files")
+originalContentPerProject(table.project_stats, "bytes")
 ```
 
+Let's now look at the most original projects, ordered first by the # of original files in them (the oldest file from each group is assumed to be original as well), and then by the number of files they contain. 
 
-Split first and last bins to see how many projects have 0 and 100% originality
-Get tokenizer to report creation dates of projects so that we can assert originals 
+```{r}
+mostOriginalProjects(table.project_stats, "files", DT_LIMIT)
+```
 
+Similarly, we can observe the least original projects:
 
-
+```{r}
+leastOriginalProjects(table.project_stats, "files", DT_LIMIT)
+```
 
 ### Clones as reported by sourcerer
 
 > These files are 70% or more compatible. 
 
-> TODO
-
-
-
-
-# Extra Stuff
-
-## More about this notebook
-
-> TODO explain how the notebook works
-
-
-
-# OLD STUFF TO BE REINCORPORATED INTO THE DOCUMENT
-
-
-#### Setting up MySQL
-
-Download MySQL using the default Linux (I can't speak for mac's) packages. It will prompt for root password - I am happily using that one. In order to be (a) able to load the data from disk, and (b) make MySQL a bit faster than the default, go into the `/etc/mysql/mysql.conf.d/mysqld.conf` and append:
-
-```
-secure_file_priv=""
-innodb_buffer_pool_size=10G # the more the better
-innodb_log_file_size=512M
-query_cache_size=0
+```{r}
+ctype = "sourcerer"
+table.originals = paste(ctype, "_originals", sep = "")
+table.clone_groups = paste(ctype, "_clone_groups", sep = "")
+table.clone_info = paste(ctype, "_clone_info", sep = "")
+table.project_stats = paste(ctype, "_project_stats", sep = "")
 ```
 
-> I have copied those from the internet and claim *no* real understanding of what they do - all I know the first one allows data loading, the second one sets memory.
 
-Once you have updated the config file, run:
+
+```{r}
+# basic info about number of files, clone groups, etc. 
+displayCloneGroupsInfo(table.clone_groups, table.clone_info, "files_full_stats")
+# files per clone group statistic
+displayFilesPerCloneGroup(table.clone_groups)
+# projects per clone group statistic
+displayProjectsPerCloneGroup(table.clone_groups)
+# Links to mostly cloned files, ordered by absolute number of copies
+mostClonedFiles(table.clone_groups, countBy = "files")
+# Links to mostly cloned files, ordered by # of projects which contain them
+mostClonedFiles(table.clone_groups, countBy = "projects")
+```
+
+```{r}
+originalContentPerProject(table.project_stats, "files")
+originalContentPerProject(table.project_stats, "bytes")
+```
+
+Let's now look at the most original projects, ordered first by the # of original files in them (the oldest file from each group is assumed to be original as well), and then by the number of files they contain. 
+
+```{r}
+mostOriginalProjects(table.project_stats, "files", DT_LIMIT)
+```
+
+Similarly, we can observe the least original projects:
+
+```{r}
+leastOriginalProjects(table.project_stats, "files", DT_LIMIT)
+```
+
+
+
+# Appendices
+
+## Appendix A - Tokenizer
+
+The tokenizer searches given set of root directories recursively. Whenever it finds a git repository, it asks git for a list of all files in the repository with their first commit dates:
 
 ```
-sudo service mysql restart
+git log --format=\"format:%at\" --name-only --diff-filter=A
 ```
 
-Then connect to it using your favourite client (mine is [DataGrip](https://www.jetbrains.com/datagrip/)) and create the databases (and usernames if you do not want to use root access). You do not have to worry about the tables as they will be automatically created when the script runs (make sure you uncomment the data loading below).
+This result is cached in a file named `cdate.js.tokenizer.txt`. The tokenizer then looks at the files, and when it finds a javascript file (`*.js`, i.e. including `*.min.js` ones), it tokenizes it and outputs three statistics:
 
-Mondego guys have a guide for using MySQL for data analysis available [here](https://github.com/Mondego/SourcererCC/blob/master/tokenizers/file-level/FileStats2MySQL.howto). It talks about python only a I had to adjust a few things on my computer to make it work, notably loading the data looks like:  
+- `files_stats` which are file statistics as mandated by sourcererCC
+- `files_tokens` which lists all tokens and number of their occurences in the file
+- `files_full_stats` which lists all statistics the tokenizer can produce (this is more than what generic sourcererCC's tokenizer is capable of)
 
-```
-LOAD DATA LOCAL INFILE filename INTO TABLE tablename;
-```
+Furthermore the tokenizer does the following:
 
-#### Configuration
+- converts each token in the file to a token id which it uses instead of the token string. This is useful for compressing the output format because the ids are smaller than token characters and also helps sourcererCC to deal with weird tokens in terms of character escaping and length (sourcererCC cannot handle very long tokens). The tokenizer computes total frequencies of all the tokens and outputs the mapping from token ids to token characters and frequencies at the end of its run into `tokens.txt` file. 
+- maintains a map of all files it has seen based on token's hash. Only emits file into `files_stats` and `files_tokens` (i.e. for sourcererCC to work on) if its identical clone has not been seen yet. `files_full_stats` contains all files. Clone pairs are stored in the `clones` directory
+- if the file is empty, it does not send it to sourcererCC as empty files cause sourcerer to complain
+- handles ASCII, UTF-8, and UTF-16 encodings
+- ignores archive files
+
+### Tokenization
+
+The tokenizer attempts to parse JavaScript properly, including full support for character literals, numbers and patterns. The tokenizer does not parse direct html insertion in javascript properly, but this feature is deprecated. If the tokenizer is not able to parse the file properly, it increases the error number of that file and attempts to recover. 
+
+Separators (operators, braces, etc.), tokens (identifiers, keywords and literals), comments and whitespace groups are distinguished and depending on the settings, any of then can be treated as tokens (i.e. submitted for clone detection analysis). This is useful during validation phase. 
+
+### Different Workers
+
+The tokenizer works in different stages to scale well to many cores. Number of threads per each class can be specified as well as maximum job queue size for different worker classes. This is important because if one class becomes a bottleneck and the previous ones get ahead of it, the memory requirements of the program grow accordingly. When thread wants to schedule a job for other worker and that job queue is full, the thread is paused until the queue allows insertion. 
+
+#### Crawler
+
+Crawlers look recursively into the directories trying to find github projects. When one is found, they pass it as a job to tokenizer and continue crawling. 
+
+#### Tokenizer
+
+Obtains list of all files in the project, and tokenizes the javascript ones. When a file is tokenized, it is passed as a job to merger. 
+
+#### Merger 
+
+> This is currently the bottleneck.
+
+Mergers are responsible for (a) clone detection and (b) translation of token characters into unique token ids. When both are done, the tokenized file, now with ids instead of token characters is passed to writers. 
+
+#### Writers
+
+Each writer has its own set of output streams (each writer does portions of *all* outputs generated by the tokenizer) and when it receives a file, it writes its statistics. Currently a single writer is enough to do the job. 
+
+## Appendix B - This notebook
+
+The notebook creates plenty of tables, ingests data into them and then performs some preprocessing. All is done in SQL and then results are displayed in R so that the entire thing fits in memory. Key to relative performance is indexing on the databases, but frankly, it is still slow:( Especially the data ingestion and preprocessing. 
+
+If I were a better man, the code would have been better commented. 
+
+> TODO someone who really knows SQL may be able to speed up our queries. 
+
+## Appendx C - Datasets
+
+### aws_processed_061116
+
+- taken on 6th November 2016
+- raw data for the dataset are in `/mnt/data1/data70k` and `/mnt/data2/data70k2` on the aws. Tokenizer & sourcererCC results can be found in `/mnt/data2/peta/processed_061116` on the server as well. 
+- includes `*.min.js`
+- tokenizer failed on file `/mnt/data2/data70k2/f/foxben/userscript/latest/monolith/46/109842.user.js`
+- repaired the dataset
+- sharding interval used was `274, 2401, 12000012` 
+
+- tokenization took ~ 9 hrs
+- clone detection preprocessing took ~ 1 hour
+- clone detection itself took ~ 6 hrs
+- entire data ingestion, preprocessing and output took ~ 4:53 start
 
 
 
