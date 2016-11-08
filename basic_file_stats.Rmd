@@ -12,15 +12,7 @@ output:
   word_document: default
 ---
 
-# TODO
-
-- indexing
-- rewrite the oldest file in group heuristic
-- check that sourcerercc clone detection works, and change if not
-- fix tokenizer & rerun if necessary
-
 # Setup
-
 
 ## AWS Instance
 
@@ -302,18 +294,18 @@ We are now going to look at various simple statistics we can obtain from the tok
 
 ```{r}
 files = list()
-files$total = sql.table.status("files_full_stats")$length
-files$unique = sql.table.status("files_stats")$length
+files$total = sql.tableStatus("files_full_stats")$length
+files$unique = sql.tableStatus("files_stats")$length
 # empty files are not part of the sourcererCC's input and must therefore be excluded
 files$empty = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE totalTokens=0")[[1]]
 # files that are reported as not fully understood by the tokenizer
 files$error = sql.query("SELECT COUNT(*) FROM files_full_stats WHERE errors>0")[[1]]
 files$distinctFileHash = sql.query("SELECT COUNT(DISTINCT filehash) FROM files_full_stats")[[1]]
 files$distinctTokenHash = sql.query("SELECT COUNT(DISTINCT tokensHash) FROM files_full_stats")[[1]]
-files$nonCloned = files$unique - sql.table.status("sourcerer_clone_info")$length
+files$nonCloned = files$unique - sql.tableStatus("sourcerer_clone_info")$length
 
 projects = list()
-projects$total = sql.table.status("bookkeeping_proj")$length
+projects$total = sql.tableStatus("bookkeeping_proj")$length
 projects$unique = sql.query("SELECT COUNT(DISTINCT projectId) FROM tokenizer_clones_stats WHERE files > 0")[[1]]
 projects$nonCloned = sql.query("SELECT COUNT(DISTINCT projectId) FROM sourcerer_clones_stats WHERE files > 0")[[1]]
 projects$uniqueAndOriginals = sql.query("SELECT COUNT(DISTINCT projectId) FROM tokenizer_project_stats WHERE files > 0")[[1]]
@@ -321,15 +313,15 @@ projects$nonClonedAndOriginals = sql.query("SELECT COUNT(DISTINCT projectId) FRO
 
 println("Total projects:                         ", projects$total)
 println("Files processed:                        ", files$total)
-println("Empty files:                            ", files$empty, "  ",files$empty / files$total, "%")
-println("Error files:                            ", files$error, "  ", files$error / files$total, "%")
-println("Distinct file hashes:                   ", files$distinctFileHash, " ", files$distinctFileHash / files$total, "%")
-println("Distinct token hashes:                  ", files$distinctTokenHash, " ", files$distinctTokenHash / files$total, "%")
-println("Non-cloned files:                       ", files$nonCloned, " ", files$nonCloned / files$total, "%")
-println("Projects with unique files:             ", projects$unique, " ", projects$unique / projects$total, "%")
-println("Projects non-cloned files:              ", projects$nonCloned, " ", projects$nonCloned / projects$total, "%")
-println("Projects with unique or original files: ", projects$uniqueAndOriginals, " ", projects$uniqueAndOriginals / projects$total, "%")
-println("Projects non-cloned or original files:  ", projects$nonClonedAndOriginals, " ", projects$nonClonedAndOriginals / projects$total, "%")
+println("Empty files:                            ", files$empty, "  ", (files$empty / files$total) * 100, "%")
+println("Error files:                            ", files$error, "  ", (files$error / files$total) * 100, "%")
+println("Distinct file hashes:                   ", files$distinctFileHash, " ", (files$distinctFileHash / files$total ) * 100, "%")
+println("Distinct token hashes:                  ", files$distinctTokenHash, " ", (files$distinctTokenHash / files$total) * 100, "%")
+println("Non-cloned files:                       ", files$nonCloned, " ", (files$nonCloned / files$total) * 100, "%")
+println("Projects with unique files:             ", projects$unique, " ", (projects$unique / projects$total) * 100, "%")
+println("Projects non-cloned files:              ", projects$nonCloned, " ", (projects$nonCloned / projects$total) * 100, "%")
+println("Projects with unique or original files: ", projects$uniqueAndOriginals, " ", (projects$uniqueAndOriginals / projects$total) * 100, "%")
+println("Projects non-cloned or original files:  ", projects$nonClonedAndOriginals, " ", (projects$nonClonedAndOriginals / projects$total) * 100, "%")
 ```
 
 > If the ratio of error files is high, then the tokenizer cannot be trusted to produce meaningful results, but small number of error files is totally ok - some of the javascript files are test cases that should error. 
@@ -457,8 +449,11 @@ x
 
 ## Data analysis of clones
 
-All files that are reported to be clone of each other belong to a _clone group_. 
+Clones are classified into _clone groups_. A clone group is set of all files that are identical , or similar (if reported by sourcererCC). Each group has an `id`, which is just an `id` of any of file that belong to it (it does not matter which one). For each group we also calculate # of files and the id of the oldest file in the group by first commit date, which we assume to be the original. 
 
+> Note that while this idea will likely work well on the entire dataset, it is almost useless for the 70k dataset as it constitutes only about 3% of the entire dataset.  
+
+Also the clone groups for tokenizer and clone groups for sourcerer are not yet unified together so originality resulst for sourcerer are even less meaningful. 
 
 ### Clones as reported by the tokenizer 
 
@@ -608,6 +603,10 @@ The notebook creates plenty of tables, ingests data into them and then performs 
 If I were a better man, the code would have been better commented. 
 
 > TODO someone who really knows SQL may be able to speed up our queries. 
+
+#### Timestamps
+
+In order not to recompute the various tables with data, the script uses timestamps. Each table has a timestamp associated with it and it is only recomputed if it's source's (file or another table) timestamp differs, or when `overwrite` is set to `"force"`
 
 ## Appendx C - Datasets
 
