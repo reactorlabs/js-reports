@@ -14,6 +14,18 @@ output:
 
 # Setup
 
+- 2-3 weeks to capture
+- 
+- stats in terms of characters (in files)
+- 
+- story, # of clones not enough
+- samples files no clones, etc. etc.
++ quality analysis
+- different clone rates for different projects
+- clustering high cloned projects
++ more data about project
+
+
 ## AWS Instance
 
 To connect to the AWS instance, you need to have the identity file (`amkey1.pem`) installed. You can then connect to the instance using the following command:
@@ -241,7 +253,7 @@ sql.connect(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB_NAME)
 loadTokenizerData(TOKENIZER_OUTPUT_DIR)
 
 # now load sourcererCC's data
-loadSourcererData(SOURCERER_OUTPUT_DIR)
+#loadSourcererData(SOURCERER_OUTPUT_DIR)
 
 # calculate non-empty files from the full statistics
 calculateNonEmptyFiles()
@@ -250,7 +262,7 @@ calculateNonEmptyFiles()
 calculateTokenizerCloneGroups("tokenizer_clones", "tokenizer")
 
 # calculate clone groups as reported by the sourcerer
-calculateCloneGroups("sourcerer_clones", "sourcerer")
+#calculateCloneGroups("sourcerer_clones", "sourcerer")
 
 # calculate project statistics
 calculateProjectStats()
@@ -268,18 +280,16 @@ calculateOriginalFiles("tokenizer_originals_clones", "files_full_stats", "tokeni
 calculateProjectOriginals("tokenizer_clones_stats", "tokenizer_originals_clones")
 
 # calculate non-identical files from sourcerer's perspective
-calculateOriginalFiles("sourcerer_originals", "files_stats", "sourcerer")
+#calculateOriginalFiles("sourcerer_originals", "files_stats", "sourcerer")
 
 # calculate cummulative statistics for projects using only non-similar files (as tagged by sourcerer)
-calculateProjectOriginals("sourcerer_project_stats", "sourcerer_originals")
+#calculateProjectOriginals("sourcerer_project_stats", "sourcerer_originals")
 
 # calculate non-identical files from sourcerer's perspective, oldest file from each group is not treated as original 
-calculateOriginalFiles("sourcerer_originals_clones", "files_full_stats", "sourcerer", include.oldest = F)
+#calculateOriginalFiles("sourcerer_originals_clones", "files_full_stats", "sourcerer", include.oldest = F)
 
 # calclate non-identical files from sourcerer's perspective, oldest files from group are treated as identical to the rest of the group
-calculateProjectOriginals("sourcerer_clones_stats", "sourcerer_originals_clones")
-
-
+#calculateProjectOriginals("sourcerer_clones_stats", "sourcerer_originals_clones")
 
 println("Total database size ", sum(sql.query("SHOW TABLE STATUS")$Data_length) / 1024 / 1024, " [Mb]")
 

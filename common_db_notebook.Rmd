@@ -1,0 +1,163 @@
+---
+title: "Clone detection stuff"
+output:
+  html_document:
+    df_print: kable
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: no
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+
+# TODO Items
+
+- 2-3 weeks to capture
+- 
+- stats in terms of characters (in files)
+- 
+- story, # of clones not enough
+- samples files no clones, etc. etc.
++ quality analysis
+- different clone rates for different projects
+- clustering high cloned projects
++ more data about project
+
+# About this notebook
+
+This notebook prepares the database tables from sourcererCC's tokenizer outputs and shows basic statistics. The following tables are created:
+
+- `projects` - project id, path and url
+- `files` - file id, path, url, size, hash
+- `filesTokens` - file id, # of tokens and unique tokens
+- `clonePairs` - clone pairs as reported by sourcererCC
+- `cloneGroups` - clone groups calculated from sourcererCC clone pairs
+- `cloneInfo` - mapping from fileIds to clone group ids
+
+# Workflow pipeline
+
+First, let's load the helper script with more complicated code:
+
+```{r}
+source("common_db_script.r")
+```
+
+Then we set the default values for database connection, and other stuff. All of these variables can be changed in file `local.r` which is not part of the repo. 
+
+```{r}
+MYSQL_HOST = "localhost" # database
+MYSQL_USER = "sourcerer" # this user must be powerful enough to create databases, or the database must already exist
+MYSQL_PASSWORD = "js"
+
+OVERWRITE = T # should data in database be overwritten? F = never, error given if newer data available, T = yes, "force" = always, regardless of timestamp
+DT_LIMIT = 20 # when showing top N results, show this many
+
+TOKENIZER_OUTPUT_DIR = "tokenizer/output/files" # where to find the tokenizer outputs
+SOURCERER_OUTPUT_DIR = paste(TOKENIZER_OUTPUT_DIR, "sourcerer", sep = "/") # where to find the sourcererCC's outputs
+
+MYSQL_DB_NAME = tail(strsplit(TOKENIZER_OUTPUT_DIR, "/")[[1]], n = 1) # name of the database to be used
+
+DATA_SOURCE = "sourcererCC" # data source, either "js-tokenizer" for javascript only tokenizer, or "sourcererCC" for the sourcererCC's default tokenizer
+
+```
+
+Load the local file, if it exists and print the settings variables we will be using:
+
+```{r}
+if (file.exists("local.r")) {
+    println("Using local cofiguration instead:")
+    source("local.r")
+    println("  MYSQL_HOST:           ", MYSQL_HOST)
+    println("  MYSQL_DB_NAME:        ", MYSQL_DB_NAME)
+    println("  MYSQL_USER:           ", MYSQL_USER)
+    #println("  MYSQL_PASSWORD:       ", MYSQL_PASSWORD) #-- we do not want the password to be in the document
+    println("  TOKENIZER_OUTPUT_DIR: ", TOKENIZER_OUTPUT_DIR)
+    println("  SOURCERER_OUTPUT_DIR: ", SOURCERER_OUTPUT_DIR)
+    println("  OVERWRITE:            ", OVERWRITE)
+    println("  DT_LIMIT:             ", DT_LIMIT)
+    println("  DATA_SOURCE:          ", DATA_SOURCE)
+}
+println("Using database ", MYSQL_DB_NAME)
+```
+
+Finally, connect to the database (the connection is persistent):
+
+```{r}
+sql.connect(MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB_NAME)
+```
+
+## Loading the raw tables
+
+The following script loads the raw data files into the specified tables:
+
+```{r}
+# create the tables (projects, files, clonePairs, cloneInfo and cloneGroups)
+createTables()
+
+# load the tables 
+loadDataFromFolder(table.projects, paste(TOKENIZER_OUTPUT_DIR, "bookkeeping_projs", sep = "/"), index = "id")
+loadDataFromFolder(table.clonePairs, SOURCERER_OUTPUT_DIR, index = "fileId1, fileId2")
+loadDataFromFolder(table.filesTokens, paste(TOKENIZER_OUTPUT_DIR, "files_tokens", sep="/"), index = "id")
+
+if (DATA_SOURCE == "js-tokenizer") {
+    # if we are using js-tokenizer we must recreate the file stats from the files_full_stats output of the tokenizer
+    createFilesTable(table.files, paste(TOKENIZER_OUTPUT_DIR, "files_full_stats", sep= "/"), index = "id")
+} else {
+    # sourcererCC's generic tokenizer produces the data we want
+    loadDataFromFolder(table.files, paste(TOKENIZER_OUTPUT_DIR, "files_stats", sep = "/"), index = "id")
+}
+
+# calculate clone groups
+calculateCloneGroups()
+```
+
+## Results
+
+This just recomputes the table in SourcererCC's results. For more computations to do, see the notebook created from our data:
+
+```{r}
+projects = list()
+projects$total = sql.tableStatus(table.projects)$length
+projects$github = projects$total # all our projects are from github
+projects$noForkJs = projects$total # none of our projects are forked and all of them are in JS
+projects$removed = 0 # we do not have repeated projects
+projects$processed = projects$total # all projects are processed
+projects$withUniqueFileHash = sql.query("SELECT COUNT(DISTINCT pid) AS result FROM (SELECT COUNT(*) AS cnt, MIN(projectId) AS pid FROM ", table.files, " GROUP BY fileHash) AS x WHERE cnt=1")$result
+
+files = list()
+
+files$total = sql.tableStatus(table.files)$length # this does not include empty files 
+# TODO how does the tokenizer give this information to the processing 
+files$error = 14 # all our errors are due to the fact the js files were not js files, but archives instead
+files$fileHashDistinctAndUnique = sql.query("SELECT COUNT(DISTINCT fileHash) AS result FROM ", table.files)$result
+files$fileHashUnique = sql.query("SELECT COUNT(*) AS result FROM (SELECT COUNT(*) AS cnt FROM ", table.files, " GROUP BY fileHash) AS x WHERE cnt = 1")$result
+files$tokenHashUnique = sql.tableStatus(table.filesTokens)$length;
+files$unique = files$tokenHashUnique - sql.tableStatus(table.cloneInfo)$length;
+
+clones = list()
+clones$pairs = sql.tableStatus(table.clonePairs)$length
+clones$uniquePairs = sql.tableStatus(table.cloneInfo)$length # TODO is this correct - I am not sure what unique pairs means
+clones$cloneGroups = sql.tableStatus(table.cloneGroups)$length
+
+# TODO nor am I sure what entire [12] means
+
+
+
+println(" [1] Number of projects:               ", projects$total)
+println(" [2] Github projects:                  ", pct(projects$github, projects$total))
+println(" [3] Github, no fork, js:              ", pct(projects$noForkJs, projects$total))
+println(" [4] Removed repeated projects:        ", pct(projects$removed, projects$total))
+println(" [5] Files processed:                  ", files$total)
+println(" [6] Files failed:                     ", pct(files$error, files$total))
+println(" [7] Projects processed:               ", pct(projects$processed, projects$total))
+println(" [8] Distinct and unique file hashes:  ", pct(files$fileHashDistinctAndUnique, files$total))
+println(" [9] Hash-unique files:                ", pct(files$fileHashUnique, files$total))
+println("[10] Projects with unique files:       ", pct(projects$withUniqueFileHash, projects$total))
+println("[11] Distinct and unique token hashes: ", pct(files$tokenHashUnique, files$total))
+println("     Total # of pairs:                 ", clones$pairs)
+println("     Unique pairs:                     ", clones$uniquePairs)
+println("     Unique files:                     ", pct(files$unique, files$total))
+```
+
